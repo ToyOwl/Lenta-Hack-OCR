@@ -1,0 +1,250 @@
+# OCR run over already-detected tracks:
+# root_dir/sequence-name/track_id/{images}
+
+io:
+  input_dir: "d:/dev/datasets/toy-dataset-2"
+  out_dir: "runs/detected_tracks_dataset"
+  recursive: true
+
+# Explicit detected-track dataset settings.
+detected_tracks_dataset:
+  root_dir: "d:/dev/datasets/toy-dataset-2"
+  out_dir: "runs/detected_tracks_dataset"
+  recursive_images_in_track: false
+  min_images_per_track: 1
+  skip_hidden: true
+
+  copy_best_debug: true
+  debug_images_dir_name: "debug_images"
+  debug_plots_dir_name: "debug_plots"
+  debug_max_image_side: 520
+  debug_upscale_small: true
+  write_debug_plots: true
+
+
+  keep_items: false
+  keep_tracks_dir: false
+  save_frame_debug: true
+  save_frame_crops: false
+  write_frame_json: true
+  write_frame_table: true
+
+  # Представительное изображение трека: несколько кадров выравниваются,
+  # проходят fastNlMeansDenoisingColored и усредняются, "то
+  # изображение используется в compact best debug; если по кадрам не найден
+  # QR/barcode, декодер пробует fused-фрагмент.
+  track_fusion:
+    enabled: true
+    max_images: 9
+    max_work_side: 900
+    align: true
+    denoise_h: 7.0
+    denoise_h_color: 7.0
+    template_window_size: 7
+    search_window_size: 21
+
+    # Visual consensus before voting/fusion.  The best frame and visually
+    # convergent frames receive a score boost; outlier frames are down-weighted.
+    score_consensus_enabled: true
+    fusion_consensus_enabled: true
+    consensus_max_candidates: 32
+    consensus_feature_size: 64
+    visual_similarity_threshold: 0.66
+    evidence_similarity_threshold: 0.50
+    min_cluster_size: 2
+
+    # OCR text proximity for consensus clustering.  Lightweight char n-gram
+    # embedding + symmetric kNN graph + GZip/NCD similarity.
+    ocr_similarity_enabled: true
+    ocr_embedding_dim: 384
+    ocr_knn_k: 4
+    ocr_similarity_threshold: 0.56
+    ocr_strong_similarity_threshold: 0.70
+    ocr_gzip_weight: 0.55
+    selected_score_boost: 0.22
+    outlier_score_penalty: 0.32
+    decode_codes_on_fused: true
+    decode_only_when_missing: true
+
+
+# Track folders already define the identity.  The aggregator is still used for
+# best-frame selection and OCR voting inside each folder.
+track_aggregation:
+  enabled: true
+  best_blur_reference: 160.0
+  price_vote_boost: 1.35
+  product_vote_boost: 1.05
+  ambiguity_ratio: 0.84
+  copy_best_frames: false
+  min_product_chars: 4
+  price_only_ok: true
+
+  # Resolve 1.79 vs 179.00 / 1.09 vs 109.00 by merging same visible digits
+  # and preferring the larger ruble interpretation for shelf-label tracks.
+  prefer_larger_decimal_shift: true
+  decimal_shift_alias_enabled: true
+  decimal_shift_min_larger_price: 5.0
+  # Merge 6/9 flip OCR variants at the track level, e.g. 66.00 vs 99.00.
+  digit_flip_alias_enabled: true
+
+  # Split detector/tracker folders when one folder contains several price tags.
+  split_mixed_tracks: true
+  split_min_segment_observations: 2
+  split_min_price_support: 2
+  split_min_reliable_score: 0.72
+  split_price_gap_ratio: 0.16
+  split_product_token_overlap: 0.34
+
+  false_tag_filter_enabled: true
+  false_tag_reject_score: 0.68
+  false_tag_review_score: 0.45
+  false_tag_max_tall_aspect: 0.62
+  false_tag_large_area: 120000
+  false_tag_min_reasonable_price: 2.0
+  unstable_price_consistency_review: 0.58
+  unstable_price_unique_reject: 4
+
+  catalog_gate_enabled: true
+  catalog_reject_on_review: true
+  catalog_min_text_score_for_track_accept: 0.50
+  catalog_min_price_consistency_for_track_accept: 0.62
+  catalog_min_product_consistency_for_track_accept: 0.62
+  debug: false
+
+input_structure:
+  mode: "single_tag"
+  save_debug: false
+
+rail_segmentation:
+  enabled: true
+  process_cells: false
+  save_rail_debug: false
+  save_cell_crops: false
+
+tilt_corrector:
+  enabled: true
+  coarse_step: 1.0
+  fine_step: 0.2
+  angle_range: 35.0
+  min_text_height: 12
+  min_abs_angle: 1.2
+  max_work_side: 900
+  save_tilt_debug: false
+  apply_before_structure: false
+  apply_before_rail: false
+  apply_to_rail_cells: true
+  debug: false
+
+
+glare_suppression:
+  enabled: true
+  # hybrid = local glare inpaint -> lightweight dark-channel dehaze -> LAB CLAHE.
+  # Safer alternatives: clahe, inpaint_glare, dark_channel.
+  method: "hybrid"
+  blend_alpha: 0.72
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: 8
+  glare_v_threshold: 210
+  glare_s_threshold: 72
+  glare_min_area_ratio: 0.002
+  glare_dilate_px: 2
+  inpaint_radius: 3.0
+  dcp_patch_size: 9
+  dcp_omega: 0.78
+  dcp_t0: 0.22
+  dcp_guided_blur: 9
+  max_work_side: 720
+  save_debug: false
+  debug: false
+
+
+code_decoder:
+  enabled: true
+  use_pyzbar: true
+  try_opencv_qr: true
+  qr_roi_scan: true
+  preprocessing_variants: true
+  keep_undecoded_qr: true
+
+ocr:
+  backend: "paddle"
+  # Batch OCR jobs inside each tag crop.  PaddleOCR 3.x uses a true list-input
+  # fast path when available; older versions fall back safely.
+  batch_inference: true
+  batch_size: 16
+  min_batch_jobs: 2
+  gpu: true
+  full_tag_ocr: true
+  debug: false
+  paddle:
+    lang: "ru"
+    ocr_version: "PP-OCRv5"
+    engine: ""
+    use_angle_cls: true
+    text_detection_model_name: "PP-OCRv5_mobile_det"
+    text_recognition_model_name: "eslav_PP-OCRv5_mobile_rec"
+    input_mode: "ndarray"
+    mkldnn: false
+    pir_api: false
+    rec_model_dir: ""
+    det_model_dir: ""
+    cls_model_dir: ""
+
+price_parser:
+  allow_compact_in_main_price_zones: true
+  # Important for detected-track crops: full_tag OCR often returns only "99" or
+  # "179".  The robust price-only fallback treats these as rubles.
+  allow_compact_in_full_tag: false
+
+# Fully deterministic catalog correction
+spatial_parser:
+  enabled: true
+  draw_semantic_boxes: true
+  draw_full_ocr: true
+  product_as_ocr_prior: true
+
+llm_corrector:
+  backend: "none"
+
+csv_corrector:
+  enabled: true
+  path: "goods.csv"
+  top_k: 8
+  min_text_score: 0.26
+  min_accept_score: 0.58
+  allow_price_correction: true
+  allow_price_only_match: true
+  allow_price_only_autofill: false
+  force_catalog_price_when_matched: false
+  max_price_conflict_ratio: 0.12
+  max_price_only_candidates: 5
+  include_raw_row: false
+  allow_close_family_match: true
+  family_match_min_name_overlap: 0.72
+  family_match_min_price_score: 0.92
+  min_text_score_with_price: 0.46
+  min_price_score_for_soft_accept: 0.94
+  reject_weak_query_text: true
+  min_query_content_tokens: 2
+  min_query_alpha_chars: 8
+  min_product_text_score_for_autofill: 0.48
+  retain_candidate_match: true
+  strong_text_accept_score: 0.48
+  debug: false
+  catalog:
+    path: "goods.csv"
+    name_column: "name"
+    item_id_column: "item_id"
+    category_id_column: "category_id"
+    brand_column: "brand"
+    category_column: "category_name"
+    unit_column: "unit"
+    quantity_column: "quantity"
+    price_columns: ["price", "price_regular", "cost", "cost_regular"]
+    top_k: 8
+    min_text_score: 0.26
+    min_accept_score: 0.58
+    max_rows: 250000
+    fuzzy_token_match: true
+    min_fuzzy_token_score: 0.74
+    max_candidate_rows: 20000

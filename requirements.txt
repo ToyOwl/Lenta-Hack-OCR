@@ -1,0 +1,21 @@
+# Recommended Python: 3.10 or 3.11. Python 3.12 may work, but is less safe for Paddle/PaddleOCR stacks.
+# Packaging/runtime hygiene
+pip>=24.0
+setuptools>=68.0
+wheel>=0.41
+packaging>=23.2
+
+numpy>=1.26.4,<2.0
+opencv-python-headless>=4.10.0.84,<4.12
+Pillow>=10.3,<12.0
+scipy>=1.11,<1.15
+
+# Config, progress, reporting/debug plots
+PyYAML>=6.0.1,<7.0
+tqdm>=4.66,<5.0
+matplotlib>=3.8,<3.11
+
+pyzbar>=0.1.9,<0.2
+
+paddlepaddle-gpu==3.0.0
+paddleocr>=3.0.0,<4.0.0

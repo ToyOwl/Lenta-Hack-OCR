@@ -1,0 +1,201 @@
+# Lenta shelf price-rail pipeline config.
+io:
+  image: ""
+  input_dir: "./rails"
+  out_dir: "./runs/rail_pipeline"
+  recursive: true
+
+output:
+  save_debug: true
+  save_crops: true
+  write_item_json: true
+  write_summary_json: true
+  write_summary_tsv: true
+
+quality:
+  min_width: 120
+  min_height: 70
+  blur_warn: 60.0
+
+color_names:
+  backend: "w2c_lut"
+  lut_path: "w2c.npy"
+  temperature: 950.0
+  max_pixels: 80000
+  w2c_index_order: "rgb_fast"
+
+template_classifier:
+  enabled: true
+
+tilt_corrector:
+  enabled: true
+  coarse_step: 1.0
+  fine_step: 0.2
+  angle_range: 18.0
+  min_text_height: 12
+  min_abs_angle: 1.2
+  max_work_side: 900
+  save_tilt_debug: true
+  apply_before_structure: true
+  apply_before_rail: false
+  apply_to_rail_cells: true
+  debug: false
+
+input_structure:
+  # auto = сначала OCR-free сопоставление: один ценник или price rail.
+  # single_tag / price_rail можно использовать для принудительного режима.
+  mode: auto
+  save_debug: true
+  min_cells_for_rail: 2
+  decision_threshold: 0.58
+  min_rail_width_ratio: 0.42
+  min_rail_area_ratio: 0.045
+  max_single_like_aspect: 2.35
+  wide_crop_aspect: 2.65
+  require_separator_or_wide: true
+  min_separator_count: 1
+
+  #Защита от ложного разбиения одного большого промо-ценника на 2-6 “ячеек”.
+  # Если splitter нашёл в основном нижнюю красную/оранжевую зону и нет
+  # физических вертикальных separator'ов на всю высоту ценника, вход остаётся single_tag.
+
+  enable_single_tag_veto: true
+  single_lower_band_y_ratio: 0.24
+  single_lower_band_max_height_ratio: 0.58
+  single_tag_veto_threshold: 0.62
+  full_height_separator_min_count: 1
+  full_height_separator_min_strength: 0.035
+  full_rail_top_y_ratio: 0.20
+  full_rail_min_height_ratio: 0.52
+  high_cell_width_cv_threshold: 0.34
+
+  # дополнительное ограниечение для одного физического ценника, где нижняя
+  # красная зона ошибочно нарезается на много внутренних price-блоков.
+  lower_band_many_cells_veto_min_count: 4
+  lower_band_many_cells_max_aspect: 2.10
+  top_context_min_height_ratio: 0.30
+  top_context_min_paper_ratio: 0.42
+  suppress_stable_repeated_counter_on_lower_band: true
+
+rail_segmentation:
+  enabled: true
+  process_cells: true
+  fallback_to_full_tag: true
+  save_rail_debug: true
+  save_cell_crops: true
+
+  # For full shelf photos keep the upper part with goods out of the search area.
+  # For already-cropped rails set search_y_min_ratio: 0.0.
+  search_y_min_ratio: 0.45
+  search_y_max_ratio: 0.98
+  min_rail_width_ratio: 0.45
+  min_rail_height_ratio: 0.055
+  max_rail_height_ratio: 0.72
+  rail_expand_y_ratio: 0.020
+  min_cell_width: 80
+  max_cell_width: 520
+  min_cells: 2
+  max_rails: 1
+  cell_expand_px: 4
+
+  # Основной режим: beam search с гипотезой одинакового шаблона у слипшихся ценников.
+  split_strategy: beam
+  beam_size: 12
+  beam_boundary_step_px: 48
+  beam_min_cell_width_ratio: 0.11
+  beam_max_cell_width_ratio: 0.42
+  beam_min_path_score: 0.45
+  same_template_beam: true
+  debug: false
+
+layout:
+  debug: false
+
+code_decoder:
+  enabled: true
+  use_pyzbar: true
+  try_opencv_qr: true
+
+ocr:
+  backend: "paddle"
+  gpu: true
+  full_tag_ocr: true
+  debug: true
+  paddle:
+    lang: "ru"
+    ocr_version: "PP-OCRv5"
+    engine: ""
+    use_angle_cls: true
+    text_detection_model_name: "PP-OCRv5_mobile_det"
+    text_recognition_model_name: "eslav_PP-OCRv5_mobile_rec"
+    input_mode: "ndarray"
+    # Positive, unambiguous runtime flags:
+    # mkldnn=false disables oneDNN/MKLDNN; pir_api=false disables Paddle PIR API.
+    mkldnn: false
+    pir_api: false
+    rec_model_dir: ""
+    det_model_dir: ""
+    cls_model_dir: ""
+
+price_parser:
+  allow_compact_in_main_price_zones: true
+  allow_compact_in_full_tag: false
+
+zones:
+  code_classes:
+    - "qr_code"
+    - "linear_barcode"
+    - "barcode"
+    - "datamatrix"
+  ocr_exclude_classes:
+    - "qr_code"
+    - "linear_barcode"
+    - "barcode"
+    - "datamatrix"
+  price_compact_classes_prefixes:
+    - "main_price"
+  crop_expand_px: 3
+
+spatial_parser:
+  enabled: true
+  draw_semantic_boxes: true
+  draw_full_ocr: true
+
+llm_corrector:
+
+  backend: "paddlenlp" # none | paddlenlp
+  model_path: "d:/dev/lenta_hack_v_0_9/models/paddlenlp/Qwen2.5-1.5B-Instruct"  # optional local PaddleNLP directory
+  model_name: "" #"Qween/Qwen2-1.5B"
+  n_ctx: 4096
+  paddlenlp_device: "auto"     # auto | cpu | gpu | gpu:0
+  paddlenlp_dtype: "auto"      # auto | float16 | bfloat16 | float32
+  paddlenlp_local_files_only: true
+  paddlenlp_trust_remote_code: false
+  n_batch: 512
+  temperature: 0.0
+  top_p: 0.95
+  max_tokens: 384
+  timeout_s: 20.0
+  force_run: false
+  run_on_templates: ["shelf_red_promo", "hanging_yellow_promo_large"]
+  run_on_warning_quality: true
+  min_ocr_confidence: 0.65
+  fallback_when_unavailable: false
+  catalog_top_k: 8
+  min_catalog_match_score: 0.56
+  debug: false
+  verbose: false
+
+  catalog:
+    path: "goods.csv"
+    name_column: "name"
+    item_id_column: "item_id"
+    brand_column: "brand"
+    manufacturer_column: "manufacturer"
+    country_column: "country"
+    price_columns: ["price", "price_regular", "cost", "cost_regular"]
+    top_k: 5
+    min_text_score: 0.30
+    min_accept_score: 0.56
+    max_rows: 200000
+
