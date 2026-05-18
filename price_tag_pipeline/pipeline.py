@@ -28,6 +28,7 @@ from .preprocess_glare import apply_glare_suppression_from_config
 from .price_rail_splitter import PriceRailSplitter, RailCell
 from .quality import compute_quality
 from .spatial_parser import parse_full_tag_spatial
+from .super_resolution import SuperResolutionPipeline
 from .template_classifier import ColorNameTemplateClassifier
 from .tilt_corrector import TiltCorrector
 
@@ -152,6 +153,7 @@ class PriceTagPipeline:
         self.config: Dict[str, Any] = deep_merge(DEFAULT_CONFIG, dict(config or {}))
         self.llm_corrector = LLMPriceTagCorrector.from_config(self.config)
         self.csv_corrector = StructuredCSVOCRCorrector.from_config(self.config)
+        self.super_resolution = SuperResolutionPipeline.from_config(self.config.get("super_resolution", {}))
 
     def process_image(self, image_path: Path, out_dir: Path) -> Dict[str, Any]:
         image = imread_unicode(image_path)
@@ -460,6 +462,12 @@ class PriceTagPipeline:
 
         save_crops = bool(output_cfg.get("save_crops", True))
         ocr_jobs: List[Dict[str, Any]] = []
+        sr_records: List[Dict[str, Any]] = []
+        sr_crops_dir = image_out_dir / "sr_crops"
+        save_sr_crops = bool(self.config.get("super_resolution", {}).get("save_crops", False))
+        if save_sr_crops:
+            sr_crops_dir.mkdir(parents=True, exist_ok=True)
+
         for idx, b in enumerate(ocr_zones):
             crop = crop_box(image, b.expand(w, h, px=crop_expand_px))
             if crop.size == 0:
@@ -467,26 +475,55 @@ class PriceTagPipeline:
             if save_crops:
                 imwrite_unicode(image_out_dir / "crops" / f"{idx:02d}_{b.cls}.jpg", crop)
             allow_compact = bool(price_cfg.get("allow_compact_in_main_price_zones", True)) and b.cls.startswith(compact_prefixes)
-            ocr_jobs.append({
-                "kind": "zone",
-                "idx": idx,
-                "class": b.cls,
-                "bbox": b.to_xyxy(),
-                "conf": b.conf,
-                "source": b.source,
-                "image": crop,
-                "allow_compact": allow_compact,
-            })
+            variants = self.super_resolution.build_variants(crop, zone_class=b.cls)
+            for variant_index, variant in enumerate(variants):
+                variant_name = str(variant.name or "raw")
+                if save_sr_crops and variant_name != "raw":
+                    imwrite_unicode(sr_crops_dir / f"{idx:02d}_{b.cls}_{variant_index:02d}_{variant_name}.jpg", variant.image)
+                if variant_name != "raw":
+                    sr_records.append({
+                        "kind": "zone",
+                        "idx": idx,
+                        "class": b.cls,
+                        "variant": variant_name,
+                        "bbox": b.to_xyxy(),
+                        "meta": variant.meta,
+                    })
+                ocr_jobs.append({
+                    "kind": "zone",
+                    "idx": idx,
+                    "class": b.cls,
+                    "bbox": b.to_xyxy(),
+                    "conf": b.conf,
+                    "source": b.source,
+                    "image": variant.image,
+                    "allow_compact": allow_compact,
+                    "sr_variant": variant_name,
+                    "sr_meta": variant.meta,
+                })
 
         full_items: List[OCRItem] = []
         full_debug: Dict[str, Any] = {}
         if bool(ocr_cfg.get("full_tag_ocr", True)):
-            ocr_jobs.append({
-                "kind": "full_tag",
-                "class": "full_tag",
-                "image": image,
-                "allow_compact": bool(price_cfg.get("allow_compact_in_full_tag", False)),
-            })
+            for variant_index, variant in enumerate(self.super_resolution.build_variants(image, zone_class="full_tag")):
+                variant_name = str(variant.name or "raw")
+                if save_sr_crops and variant_name != "raw":
+                    imwrite_unicode(sr_crops_dir / f"full_tag_{variant_index:02d}_{variant_name}.jpg", variant.image)
+                if variant_name != "raw":
+                    sr_records.append({
+                        "kind": "full_tag",
+                        "class": "full_tag",
+                        "variant": variant_name,
+                        "meta": variant.meta,
+                    })
+                ocr_jobs.append({
+                    "kind": "full_tag",
+                    "class": "full_tag",
+                    "image": variant.image,
+                    "allow_compact": bool(price_cfg.get("allow_compact_in_full_tag", False)),
+                    "sr_variant": variant_name,
+                    "sr_meta": variant.meta,
+                })
 
         batch_enabled = bool(ocr_cfg.get("batch_inference", True))
         min_batch_jobs = max(2, int(ocr_cfg.get("min_batch_jobs", 2)))
@@ -508,10 +545,15 @@ class PriceTagPipeline:
             items = list(items or [])
             prices = parse_prices_from_texts([it.text for it in items], allow_compact=bool(job.get("allow_compact", False)))
             if job.get("kind") == "full_tag":
-                full_items = items
-                full_debug = {"batch_job_index": job_index, **batch_debug} if bool(ocr_cfg.get("debug", False)) else {}
+                full_items.extend(items)
+                if bool(ocr_cfg.get("debug", False)):
+                    full_debug.setdefault("jobs", []).append({
+                        "batch_job_index": job_index,
+                        "sr_variant": job.get("sr_variant", "raw"),
+                        **batch_debug,
+                    })
                 if prices:
-                    zone_prices["full_tag"] = prices
+                    zone_prices.setdefault("full_tag", []).extend(prices)
                 continue
 
             cls_name = str(job.get("class") or "")
@@ -523,6 +565,8 @@ class PriceTagPipeline:
                 "bbox": job.get("bbox"),
                 "conf": job.get("conf"),
                 "source": job.get("source"),
+                "sr_variant": job.get("sr_variant", "raw"),
+                "sr_meta": job.get("sr_meta", {}),
                 "ocr": [it.to_dict() for it in items],
                 "ocr_debug": {"batch_job_index": job_index, **batch_debug} if bool(ocr_cfg.get("debug", False)) else {},
                 "price_candidates": prices,
@@ -603,6 +647,11 @@ class PriceTagPipeline:
                 "by_zone": zone_prices,
             },
             "glare_suppression": glare_meta,
+            "super_resolution": {
+                **self.super_resolution.describe(),
+                "applied_count": len(sr_records),
+                "records": sr_records,
+            },
         }
         if extra_meta:
             result.update(extra_meta)

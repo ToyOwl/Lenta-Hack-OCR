@@ -3,6 +3,18 @@
 Пайплайн распознавания розничных ценников и ценовых лент в выделенных видео-треков ценников. Проект ориентирован на следующий сценарий применения: камера получает поток с полки, detector/tracker выделяет crop'ы ценников, OCR-пайплайн извлекает цену, товар, скидку, служебные статусы, QR/barcode/DataMatrix и диагностические признаки качества.
 Основной акцент текущей версии принятие решения по треку: несколько кадров одного ценника выравниваются, проходят OCR, голосование, visual/OCR consensus, denoise/fusion и проверку через каталог `goods.csv`.
 
+
+Актуальные изменения этой ревизии:
+
+- добавлены итоговые файлы `detected_tracks_task_output.csv` и `detected_tracks_task_output.json` с полями задания;
+- добавлена поддержка исходных координат ценника в полном кадре через CSV `frame_idx,tr_id,xyxy`;
+- если CSV с координатами не указан или запись не найдена, используются локальные координаты crop-а `0,0,w,h`;
+- кадры трека сортируются и идентифицируются по имени файла: `6085.jpg -> frame_index=6085`;
+- добавлены SR-профили `light`, `medium`, `heavy`, включая рабочий `paddle_sr_dynamic` backend для PaddleOCR SR;
+- уточнена логика цены/скидки: `28%1199` разбирается как скидка `28%` и отдельный price candidate;
+- добавлена HSV-проверка цвета ценника, чтобы жёлтые progressive-ценники не классифицировались как красные промо;
+- debug-карточка теперь структурирована как: изображение ценника -> `CSV/JSON поля` -> QR-поля -> диагностическая информация.
+
 ---
 
 ### Поля товара и каталога
@@ -126,18 +138,36 @@ python run_detected_tracks_dataset.py \
 ```text
 root_dir/
   sequence_001/
-    7/
-      frame_0001.jpg
-      frame_0002.jpg
+    id_7/
+      6085.jpg
+      5895.jpg
       ...
-    210/
-      frame_0001.jpg
-      frame_0002.jpg
+    id_210/
+      7112.jpg
+      7120.jpg
       ...
   sequence_002/
     33/
-      frame_0001.jpg
+      1001.jpg
       ...
+```
+
+Имя crop-файла трактуется как номер исходного кадра видео:
+
+```text
+6085.jpg -> frame_index = 6085
+5895.jpg -> frame_index = 5895
+```
+
+Рекомендуемый YAML для таких раскадрованных crop-ов:
+
+```yaml
+detected_tracks_dataset:
+  frame_index:
+    source: filename_stem
+    sort_by: frame_index
+    strict: false
+    fallback: enumerate
 ```
 
 debug-режим:
@@ -216,6 +246,68 @@ scripts/
   download_paddlenlp_qwen.py          # загрузка локального PaddleNLP/Qwen
 ```
 
+
+---
+
+## Исходные координаты полного кадра
+
+Detected-track режим может работать с crop-ами, но выходной CSV/JSON часто требует координаты ценника в полном кадре исходного видео. Для этого добавлен optional CSV с исходными координатами:
+
+```csv
+frame_idx,tr_id,xyxy
+6085,id_28,"100,220,480,390"
+5895,28,"102,218,482,391"
+```
+
+Поддерживаются оба варианта `tr_id`:
+
+```text
+28
+id_28
+track_28
+sequence_001/id_28
+```
+
+YAML:
+
+```yaml
+detected_tracks_dataset:
+  original_coordinates:
+    enabled: true
+    csv_path: "D:/dev/lenta_hack_v_0_9/data/original_coords.csv"
+    frame_col: frame_idx
+    track_col: tr_id
+    xyxy_col: xyxy
+    delimiter: auto
+    encoding: utf-8-sig
+    strict: false
+    fallback_to_crop_bbox: true
+    coordinate_child_mode: track_bbox
+```
+
+CLI override:
+
+```bash
+python run_detected_tracks_dataset.py \
+  --config configs/detected_tracks_dataset_sr_medium.yaml \
+  --original_coords_csv D:/dev/lenta_hack_v_0_9/data/original_coords.csv
+```
+
+Если `csv_path` не указан, файл отсутствует или запись `(frame_idx, tr_id)` не найдена, пайплайн не падает. При `fallback_to_crop_bbox: true` используются локальные координаты crop-а:
+
+```text
+x_min = 0
+y_min = 0
+x_max = crop_width
+y_max = crop_height
+```
+
+Проверочная заглушка:
+
+```bash
+python scripts/test_original_coordinates_stub.py
+```
+
 ---
 
 ## End-to-end логика
@@ -278,6 +370,69 @@ ocr:
 ```
 
 Пайплайн собирает OCR-задачи внутри одного tag crop и отправляет их пачкой, если текущая версия PaddleOCR поддерживает list-input. 
+
+
+---
+
+## SR-профили: light / medium / heavy
+
+Для OCR-зон доступны три профиля обработки. Профиль выбирается YAML-конфигом.
+
+### Light
+
+Файл:
+
+```text
+configs/detected_tracks_dataset_sr_light.yaml
+```
+
+Назначение: быстрый baseline. Track fusion и тяжёлая коррекция отключены. Используется PaddleOCR и лёгкая OpenCV/Lanczos SR.
+
+### Medium
+
+Файл:
+
+```text
+configs/detected_tracks_dataset_sr_medium.yaml
+```
+
+Назначение: рабочий компромисс качества и скорости. Включаются focus selection, track fusion, phase/ECC alignment и OpenCV SR. PaddleOCR SR параметры присутствуют, но обычно выключены по умолчанию.
+
+### Heavy
+
+Файл:
+
+```text
+configs/detected_tracks_dataset_sr_heavy.yaml
+```
+
+Назначение: recovery/quality mode. Включает track fusion, safe tag correction, QR fallback и PaddleOCR SR dynamic для text-line зон.
+
+Рабочий backend PaddleOCR SR:
+
+```yaml
+- name: paddle_telescope_tbsrn_dynamic
+  backend: paddle_sr_dynamic
+  repo_dir: "D:/dev/lenta_hack_v_0_9/third_party/PaddleOCR"
+  config: "D:/dev/lenta_hack_v_0_9/third_party/PaddleOCR/configs/sr/sr_telescope.yml"
+  checkpoint_prefix: "D:/dev/lenta_hack_v_0_9/models/paddle_sr/_work/extracted/telescope/sr_telescope_train/best_accuracy"
+  image_shape: "3,32,128"
+  use_gpu: false
+  output_scale_hint: 2.0
+```
+
+PaddleOCR SR является text-line SR, поэтому его нельзя применять к `full_tag`, `qr_code`, `barcode`, `datamatrix`. Он предназначен для зон:
+
+```text
+product_name
+main_price
+kopeeks
+discount
+old_price
+small_text
+```
+
+OpenCV/Lanczos SR можно использовать для full-tag и QR preprocessing. QR/DataMatrix не должны проходить через text-SR.
 
 ---
 
@@ -568,6 +723,79 @@ python scripts/convert_w2c_mat_to_npy.py \
   --output ./w2c.npy
 ```
 
+
+---
+
+## Итоговые CSV/JSON файлы задания
+
+После обработки detected-track датасета формируются два основных файла:
+
+```text
+detected_tracks_task_output.csv
+detected_tracks_task_output.json
+```
+
+Одна строка соответствует одному финальному ценнику / track. Базовые поля:
+
+```text
+filename
+product_name
+price_default
+price_card
+price_discount
+barcode
+discount_amount
+id_sku
+print_datetime
+code
+additional_info
+color
+special_symbols
+frame_timestamp
+x_min
+y_min
+x_max
+y_max
+```
+
+QR-поля:
+
+```text
+qr_code_barcode
+price1_qr
+price2_qr
+price3_qr
+price4_qr
+wholesale_level_1_count
+wholesale_level_1_price
+wholesale_level_2_count
+wholesale_level_2_price
+action_price_qr
+action_code_qr
+```
+
+Конфиг:
+
+```yaml
+task_output:
+  enabled: true
+  csv_name: detected_tracks_task_output.csv
+  json_name: detected_tracks_task_output.json
+  absent_value: "нет"
+  empty_value: ""
+  main_price_target: price_card
+  video_fps: 25.0
+  fallback_frame_index_as_timestamp: false
+```
+
+`frame_timestamp` рассчитывается по `frame_index` из имени crop-файла:
+
+```text
+frame_timestamp_ms = frame_index / video_fps * 1000
+```
+
+Если FPS неизвестен, можно оставить `video_fps: 0.0`. В этом случае timestamp остаётся пустым. Для временной диагностики можно включить `fallback_frame_index_as_timestamp: true`, тогда в поле будет записан номер кадра.
+
 ---
 
 ## Debug-артефакты
@@ -615,6 +843,34 @@ runs/detected_tracks_dataset/
     *_timeline.png
     *_votes.png
     global__*.png
+```
+
+Best debug-card теперь имеет структурированный вид:
+
+```text
+Ценник: sequence/track_id
+
+[изображение ценника]
+
+CSV/JSON поля
+  product_name
+  price_default / price_card / price_discount
+  discount_amount
+  id_sku
+  color
+  x_min/y_min/x_max/y_max
+
+Данные QR-кода
+  qr_code_barcode
+  price*_qr
+  action_*_qr
+
+Дополнительная диагностика
+  status
+  warnings
+  catalog_status
+  price/product consistency
+  sr_variant
 ```
 
 Ключевые поля summary:
@@ -890,6 +1146,9 @@ runs/smoke_tracks/debug_plots/
 
 ## Ограничения текущей реализации
 
+- Если CSV исходных координат не задан, выходные `x_min/y_min/x_max/y_max` являются координатами crop-а, а не полного кадра.
+- PaddleOCR SR через exported `inference.json` нестабилен в текущей связке Paddle 3.x/Windows; для baseline используется `paddle_sr_dynamic` по checkpoint-у.
+- `frame_timestamp` корректен только при заданном `task_output.video_fps`.
 - OCR остаётся главным источником ошибок на мелком, смазанном и бликующем тексте.
 - Batch OCR зависит от версии PaddleOCR: если list-input не поддерживается, используется fallback.
 - DB/CSV matching не должен рассматриваться как ground truth. При слабом OCR безопаснее получить `needs_review`, чем ложный `item_id`.

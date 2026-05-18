@@ -38,13 +38,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
   "layout": {"debug": False,},
 
-  "code_decoder": {"enabled": True, "use_pyzbar": True, "try_opencv_qr": True, "qr_roi_scan": True, "preprocessing_variants": True, "keep_undecoded_qr": True,},
+  "code_decoder": {"enabled": True, "use_pyzbar": True, "try_opencv_qr": True, "qr_roi_scan": True, "preprocessing_variants": True, "keep_undecoded_qr": True,
+        "qr_sr_enabled": True, "qr_sr_scale": 2.0, "qr_sr_min_side": 420, "qr_sr_max_side": 1400, "qr_sr_method": "lanczos",
+        "qr_perspective_warp": True, "qr_morphology": True, "max_rois": 6, "max_variants_per_roi": 10, "qr_contour_max_rois": 4,},
 
   "ocr": {"backend": "paddle", "gpu": False, "full_tag_ocr": True, "debug": False,
           "paddle": {"lang": "ru", "ocr_version": "PP-OCRv5", "engine": "","use_angle_cls": True, "text_detection_model_name": "PP-OCRv5_mobile_det",
             "text_recognition_model_name": "eslav_PP-OCRv5_mobile_rec", "input_mode": "ndarray",  "mkldnn": False, "pir_api": False, "offline": False,
             "paddlex_model_source": "", "paddlex_disable_model_source_check": True,
             "rec_model_dir": "", "det_model_dir": "", "cls_model_dir": "", },},
+
+  "super_resolution": {
+        "enabled": False,
+        "profile": "light",
+        "strategy": "replace_if_small",
+        "save_crops": False,
+        "include_raw_when_appending": True,
+        "max_variants_per_crop": 3,
+        "apply_to": ["main_price*", "*price*", "product_name", "scale_number", "promo_header", "footer_note", "card_price_small", "no_card_price_small"],
+        "skip_for": ["full_tag", "qr_code", "linear_barcode", "barcode", "datamatrix"],
+        "trigger": {"run_if_min_side_lt": 180, "run_if_height_lt": 52, "always_for_classes": ["main_price*", "*kopeeks*", "*old_price*", "*discount*"]},
+        "profiles": {
+            "light": {
+                "backends": [
+                    {"name": "opencv_lanczos_x2", "backend": "opencv_resize", "method": "lanczos", "scale": 2.0, "max_side": 1200, "sharpen": True}
+                ]
+            },
+            "heavy": {
+                "backends": [
+                    {"name": "opencv_lanczos_x2", "backend": "opencv_resize", "method": "lanczos", "scale": 2.0, "max_side": 1200, "sharpen": True},
+                    {"name": "paddle_telescope_tbsrn_dynamic", "backend": "paddle_sr_dynamic", "repo_dir": "third_party/PaddleOCR", "config": "third_party/PaddleOCR/configs/sr/sr_telescope.yml", "checkpoint_prefix": "models/paddle_sr/_work/extracted/telescope/sr_telescope_train/best_accuracy", "image_shape": "3,32,128", "use_gpu": False, "network_downscale": 2, "norm": "minus_one_one", "output_scale_hint": 2.0}
+                ]
+            }
+        },
+    },
 
   "llm_corrector": {"backend": "none",  "model_path": "", "endpoint_url": "", "api_key": "", "model_name": "", "n_ctx": 4096,
         "paddlenlp_device": "auto",   "paddlenlp_dtype": "auto",  "paddlenlp_local_files_only": False, "paddlenlp_trust_remote_code": False,
@@ -78,8 +105,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "false_tag_max_tall_aspect": 0.62, "false_tag_large_area": 120000, "false_tag_min_reasonable_price": 2.0,
         "unstable_price_consistency_review": 0.58, "unstable_price_unique_reject": 4, "debug": False,},
 
+  "task_output": {"enabled": True, "csv_name": "detected_tracks_task_output.csv", "json_name": "detected_tracks_task_output.json",
+        "absent_value": "нет", "empty_value": "", "main_price_target": "price_card",
+        "video_fps": 0.0, "fallback_frame_index_as_timestamp": False,},
+
   "detected_tracks_dataset": {"root_dir": "", "out_dir": "runs/detected_tracks_dataset", "recursive_images_in_track": False,
-        "min_images_per_track": 1, "skip_hidden": True, "copy_best_debug": True, "debug_images_dir_name": "debug_images",
+        "min_images_per_track": 1, "skip_hidden": True,
+        "frame_index": {"source": "auto", "regex": "", "sort_by": "frame_index", "strict": False, "fallback": "enumerate"},
+        "original_coordinates": {"enabled": False, "csv_path": "", "frame_col": "frame_idx", "track_col": "tr_id", "xyxy_col": "xyxy",
+            "delimiter": "auto", "encoding": "utf-8-sig", "strict": False, "fallback_to_crop_bbox": True,
+            "coordinate_child_mode": "track_bbox", "auto_find": False,
+            "auto_find_names": ["original_coordinates.csv", "detections.csv", "tracks.csv", "bboxes.csv"]},
+        "copy_best_debug": True, "debug_images_dir_name": "debug_images",
         "debug_plots_dir_name": "debug_plots", "debug_max_image_side": 520, "debug_upscale_small": True,
         "write_debug_plots": True, "keep_items": False, "keep_tracks_dir": False,
         "save_frame_debug": False, "save_frame_crops": False, "write_frame_json": False, "write_frame_table": True,
@@ -90,8 +127,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "min_cluster_size": 2,
             "ocr_similarity_enabled": True, "ocr_embedding_dim": 384, "ocr_knn_k": 4,
             "ocr_similarity_threshold": 0.56, "ocr_strong_similarity_threshold": 0.70, "ocr_gzip_weight": 0.55,
+            "focus_selection_enabled": True, "focus_score_weight": 0.18, "focus_roi_policy": "price_tag", "min_focus_norm_for_fusion": 0.12,
             "selected_score_boost": 0.22, "outlier_score_penalty": 0.32,
-            "decode_codes_on_fused": True, "decode_only_when_missing": True,},},
+            "align_mode": "phase_ecc", "ecc_motion": "euclidean", "ecc_min_correlation": 0.18, "phase_min_response": 0.08, "max_translation_ratio": 0.22,
+            "denoise_stage": "post_fusion",
+            "sr_enabled": True, "sr_scale": 2.0, "sr_stage": "pre_nlmeans", "sr_min_side": 360, "sr_max_side": 1400, "sr_method": "lanczos",
+            "tag_correction_enabled": True, "save_tag_corrected": True, "tag_correction_profile": "safe", "tag_correction_sr_enabled": False, "tag_correction_clahe_clip": 1.85,
+            "tag_correction_text_gain": 0.22, "tag_correction_red_zone_gain": 0.07, "tag_correction_glare_suppression": True,
+            "tag_correction_gray_world_strength": 0.35, "tag_correction_glare_max_area_ratio": 0.045,
+            "tag_correction_blackhat_kernel_ratio": 0.020, "tag_correction_final_unsharp_amount": 0.10,
+            "decode_codes_on_fused": True, "decode_codes_on_corrected": True, "decode_only_when_missing": True, "stop_code_decode_after_first_payload": True,},
+        "sr_recovery": {"enabled": False, "min_good_product_frames": 2, "min_good_price_frames": 0, "trigger_if_product_missing": True,
+            "trigger_if_price_only": True, "min_observations_before_recovery": 2, "max_recovery_frames": 3,
+            "score_multiplier": 0.92, "item_suffix": "__srrec", "prefer_frames_without_product": True,
+            "min_product_chars": 8, "min_product_alpha_chars": 6, "min_catalog_score": 0.46,
+            "accepted_catalog_statuses": ["accepted", "strong_accept", "soft_accept", "price_text_soft_accept"],
+            "config_overrides": {},},},
 
   "price_parser": {"allow_compact_in_main_price_zones": True, "allow_compact_in_full_tag": False,},
 

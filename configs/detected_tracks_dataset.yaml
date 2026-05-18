@@ -1,38 +1,48 @@
-# OCR run over already-detected tracks:
-# root_dir/sequence-name/track_id/{images}
-
 io:
-  input_dir: "d:/dev/datasets/toy-dataset-2"
-  out_dir: "runs/detected_tracks_dataset"
+  input_dir: d:/dev/datasets/toy-dataset-2
+  out_dir: runs/detected_tracks_dataset
   recursive: true
-
-# Explicit detected-track dataset settings.
 detected_tracks_dataset:
-  root_dir: "d:/dev/datasets/toy-dataset-2"
-  out_dir: "runs/detected_tracks_dataset"
+  root_dir: d:/dev/datasets/toy-dataset-2
+  out_dir: runs/detected_tracks_dataset
   recursive_images_in_track: false
   min_images_per_track: 1
   skip_hidden: true
-
+  frame_index:
+    source: filename_stem
+    regex: ''
+    sort_by: frame_index
+    strict: false
+    fallback: enumerate
+  original_coordinates:
+    enabled: false
+    csv_path: ''
+    frame_col: frame_idx
+    track_col: tr_id
+    xyxy_col: xyxy
+    delimiter: auto
+    encoding: utf-8-sig
+    strict: false
+    fallback_to_crop_bbox: true
+    coordinate_child_mode: track_bbox
+    auto_find: false
+    auto_find_names:
+    - original_coordinates.csv
+    - detections.csv
+    - tracks.csv
+    - bboxes.csv
   copy_best_debug: true
-  debug_images_dir_name: "debug_images"
-  debug_plots_dir_name: "debug_plots"
+  debug_images_dir_name: debug_images
+  debug_plots_dir_name: debug_plots
   debug_max_image_side: 520
   debug_upscale_small: true
   write_debug_plots: true
-
-
   keep_items: false
   keep_tracks_dir: false
   save_frame_debug: true
   save_frame_crops: false
   write_frame_json: true
   write_frame_table: true
-
-  # Представительное изображение трека: несколько кадров выравниваются,
-  # проходят fastNlMeansDenoisingColored и усредняются, "то
-  # изображение используется в compact best debug; если по кадрам не найден
-  # QR/barcode, декодер пробует fused-фрагмент.
   track_fusion:
     enabled: true
     max_images: 9
@@ -42,33 +52,53 @@ detected_tracks_dataset:
     denoise_h_color: 7.0
     template_window_size: 7
     search_window_size: 21
-
-    # Visual consensus before voting/fusion.  The best frame and visually
-    # convergent frames receive a score boost; outlier frames are down-weighted.
     score_consensus_enabled: true
     fusion_consensus_enabled: true
     consensus_max_candidates: 32
     consensus_feature_size: 64
     visual_similarity_threshold: 0.66
-    evidence_similarity_threshold: 0.50
+    evidence_similarity_threshold: 0.5
     min_cluster_size: 2
-
-    # OCR text proximity for consensus clustering.  Lightweight char n-gram
-    # embedding + symmetric kNN graph + GZip/NCD similarity.
     ocr_similarity_enabled: true
     ocr_embedding_dim: 384
     ocr_knn_k: 4
     ocr_similarity_threshold: 0.56
-    ocr_strong_similarity_threshold: 0.70
+    ocr_strong_similarity_threshold: 0.7
     ocr_gzip_weight: 0.55
+    focus_selection_enabled: true
+    focus_score_weight: 0.18
+    focus_roi_policy: price_tag
+    min_focus_norm_for_fusion: 0.12
     selected_score_boost: 0.22
     outlier_score_penalty: 0.32
+    align_mode: phase_ecc
+    ecc_motion: euclidean
+    ecc_min_correlation: 0.18
+    phase_min_response: 0.08
+    max_translation_ratio: 0.22
+    denoise_stage: post_fusion
+    sr_enabled: true
+    sr_scale: 2.0
+    sr_stage: pre_nlmeans
+    sr_min_side: 360
+    sr_max_side: 1400
+    sr_method: lanczos
+    tag_correction_enabled: true
+    save_tag_corrected: true
+    tag_correction_profile: safe
+    tag_correction_sr_enabled: false
+    tag_correction_clahe_clip: 1.85
+    tag_correction_text_gain: 0.22
+    tag_correction_red_zone_gain: 0.07
+    tag_correction_glare_suppression: true
+    tag_correction_gray_world_strength: 0.35
+    tag_correction_glare_max_area_ratio: 0.045
+    tag_correction_blackhat_kernel_ratio: 0.02
+    tag_correction_final_unsharp_amount: 0.1
     decode_codes_on_fused: true
+    decode_codes_on_corrected: true
     decode_only_when_missing: true
-
-
-# Track folders already define the identity.  The aggregator is still used for
-# best-frame selection and OCR voting inside each folder.
+    stop_code_decode_after_first_payload: true
 track_aggregation:
   enabled: true
   best_blur_reference: 160.0
@@ -78,23 +108,16 @@ track_aggregation:
   copy_best_frames: false
   min_product_chars: 4
   price_only_ok: true
-
-  # Resolve 1.79 vs 179.00 / 1.09 vs 109.00 by merging same visible digits
-  # and preferring the larger ruble interpretation for shelf-label tracks.
   prefer_larger_decimal_shift: true
   decimal_shift_alias_enabled: true
   decimal_shift_min_larger_price: 5.0
-  # Merge 6/9 flip OCR variants at the track level, e.g. 66.00 vs 99.00.
   digit_flip_alias_enabled: true
-
-  # Split detector/tracker folders when one folder contains several price tags.
   split_mixed_tracks: true
   split_min_segment_observations: 2
   split_min_price_support: 2
   split_min_reliable_score: 0.72
   split_price_gap_ratio: 0.16
   split_product_token_overlap: 0.34
-
   false_tag_filter_enabled: true
   false_tag_reject_score: 0.68
   false_tag_review_score: 0.45
@@ -103,24 +126,20 @@ track_aggregation:
   false_tag_min_reasonable_price: 2.0
   unstable_price_consistency_review: 0.58
   unstable_price_unique_reject: 4
-
   catalog_gate_enabled: true
   catalog_reject_on_review: true
-  catalog_min_text_score_for_track_accept: 0.50
+  catalog_min_text_score_for_track_accept: 0.5
   catalog_min_price_consistency_for_track_accept: 0.62
   catalog_min_product_consistency_for_track_accept: 0.62
   debug: false
-
 input_structure:
-  mode: "single_tag"
+  mode: single_tag
   save_debug: false
-
 rail_segmentation:
   enabled: true
   process_cells: false
   save_rail_debug: false
   save_cell_crops: false
-
 tilt_corrector:
   enabled: true
   coarse_step: 1.0
@@ -134,13 +153,9 @@ tilt_corrector:
   apply_before_rail: false
   apply_to_rail_cells: true
   debug: false
-
-
 glare_suppression:
   enabled: true
-  # hybrid = local glare inpaint -> lightweight dark-channel dehaze -> LAB CLAHE.
-  # Safer alternatives: clahe, inpaint_glare, dark_channel.
-  method: "hybrid"
+  method: hybrid
   blend_alpha: 0.72
   clahe_clip_limit: 2.0
   clahe_tile_grid_size: 8
@@ -156,8 +171,6 @@ glare_suppression:
   max_work_side: 720
   save_debug: false
   debug: false
-
-
 code_decoder:
   enabled: true
   use_pyzbar: true
@@ -165,11 +178,18 @@ code_decoder:
   qr_roi_scan: true
   preprocessing_variants: true
   keep_undecoded_qr: true
-
+  qr_sr_enabled: true
+  qr_sr_scale: 2.0
+  qr_sr_min_side: 420
+  qr_sr_max_side: 1400
+  qr_sr_method: lanczos
+  qr_perspective_warp: true
+  qr_morphology: true
+  max_rois: 6
+  max_variants_per_roi: 10
+  qr_contour_max_rois: 4
 ocr:
-  backend: "paddle"
-  # Batch OCR jobs inside each tag crop.  PaddleOCR 3.x uses a true list-input
-  # fast path when available; older versions fall back safely.
+  backend: paddle
   batch_inference: true
   batch_size: 16
   min_batch_jobs: 2
@@ -177,38 +197,31 @@ ocr:
   full_tag_ocr: true
   debug: false
   paddle:
-    lang: "ru"
-    ocr_version: "PP-OCRv5"
-    engine: ""
+    lang: ru
+    ocr_version: PP-OCRv5
+    engine: ''
     use_angle_cls: true
-    text_detection_model_name: "PP-OCRv5_mobile_det"
-    text_recognition_model_name: "eslav_PP-OCRv5_mobile_rec"
-    input_mode: "ndarray"
+    text_detection_model_name: PP-OCRv5_mobile_det
+    text_recognition_model_name: eslav_PP-OCRv5_mobile_rec
+    input_mode: ndarray
     mkldnn: false
     pir_api: false
-    rec_model_dir: ""
-    det_model_dir: ""
-    cls_model_dir: ""
-
+    rec_model_dir: ''
+    det_model_dir: ''
+    cls_model_dir: ''
 price_parser:
   allow_compact_in_main_price_zones: true
-  # Important for detected-track crops: full_tag OCR often returns only "99" or
-  # "179".  The robust price-only fallback treats these as rubles.
   allow_compact_in_full_tag: false
-
-# Fully deterministic catalog correction
 spatial_parser:
   enabled: true
   draw_semantic_boxes: true
   draw_full_ocr: true
   product_as_ocr_prior: true
-
 llm_corrector:
-  backend: "none"
-
+  backend: none
 csv_corrector:
   enabled: true
-  path: "goods.csv"
+  path: goods.csv
   top_k: 8
   min_text_score: 0.26
   min_accept_score: 0.58
@@ -232,15 +245,19 @@ csv_corrector:
   strong_text_accept_score: 0.48
   debug: false
   catalog:
-    path: "goods.csv"
-    name_column: "name"
-    item_id_column: "item_id"
-    category_id_column: "category_id"
-    brand_column: "brand"
-    category_column: "category_name"
-    unit_column: "unit"
-    quantity_column: "quantity"
-    price_columns: ["price", "price_regular", "cost", "cost_regular"]
+    path: goods.csv
+    name_column: name
+    item_id_column: item_id
+    category_id_column: category_id
+    brand_column: brand
+    category_column: category_name
+    unit_column: unit
+    quantity_column: quantity
+    price_columns:
+    - price
+    - price_regular
+    - cost
+    - cost_regular
     top_k: 8
     min_text_score: 0.26
     min_accept_score: 0.58
@@ -248,3 +265,12 @@ csv_corrector:
     fuzzy_token_match: true
     min_fuzzy_token_score: 0.74
     max_candidate_rows: 20000
+task_output:
+  enabled: true
+  csv_name: detected_tracks_task_output.csv
+  json_name: detected_tracks_task_output.json
+  absent_value: нет
+  empty_value: ''
+  main_price_target: price_card
+  video_fps: 0.0
+  fallback_frame_index_as_timestamp: false

@@ -31,6 +31,16 @@ def build_code_decoder(cfg: Dict[str, Any]) -> CodeDecoder:
         qr_roi_scan=bool(c.get("qr_roi_scan", True)),
         preprocessing_variants=bool(c.get("preprocessing_variants", True)),
         keep_undecoded_qr=bool(c.get("keep_undecoded_qr", True)),
+        qr_sr_enabled=bool(c.get("qr_sr_enabled", True)),
+        qr_sr_scale=float(c.get("qr_sr_scale", 2.0)),
+        qr_sr_min_side=int(c.get("qr_sr_min_side", 420)),
+        qr_sr_max_side=int(c.get("qr_sr_max_side", 1400)),
+        qr_sr_method=str(c.get("qr_sr_method", "lanczos")),
+        qr_perspective_warp=bool(c.get("qr_perspective_warp", True)),
+        qr_morphology=bool(c.get("qr_morphology", True)),
+        max_rois=int(c.get("max_rois", 6)),
+        max_variants_per_roi=int(c.get("max_variants_per_roi", 10)),
+        qr_contour_max_rois=int(c.get("qr_contour_max_rois", 4)),
     )
 
 

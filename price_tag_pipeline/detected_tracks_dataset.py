@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import shutil
 import sys
 
@@ -44,11 +45,12 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 from .code_decoder import CodeDecoder
-from .config import dump_config
+from .config import deep_merge, dump_config
 from .debug_vis import _draw_text_pil, truncate_text
 from .io_utils import IMG_EXTS, imread_unicode, imwrite_unicode, safe_stem
 from .layout import HeuristicLayoutExtractor
 from .ocr_backends import OCRBackend
+from .original_coordinates import OriginalCoordinateMap, build_original_coordinate_map
 from .pipeline import PriceTagPipeline
 from .template_classifier import ColorNameTemplateClassifier
 from .track_aggregator import (
@@ -59,6 +61,8 @@ from .track_aggregator import (
 )
 from .track_debug_plots import write_global_debug_plots, write_track_debug_plots
 from .track_image_fusion import apply_track_consensus_scores, fuse_track_images, has_decoded_code
+from .tag_qr_enhancement import build_fused_tag_variants
+from .submission_output import TASK_OUTPUT_FIELDS, build_task_output_record, write_task_outputs
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,11 @@ class FrameRunRecord:
     glare_applied: Any = ""
     glare_method: str = ""
     needs_review: Any = ""
+    bbox_source: str = ""
+    x_min: Any = ""
+    y_min: Any = ""
+    x_max: Any = ""
+    y_max: Any = ""
     error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -201,11 +210,14 @@ def process_detected_tracks_dataset(
 
     recursive_images = bool(dt_cfg.get("recursive_images_in_track", False))
     min_images_per_track = int(dt_cfg.get("min_images_per_track", 1))
+    frame_index_cfg = _frame_index_cfg(dt_cfg)
+    original_coord_map = build_original_coordinate_map(dt_cfg, root_dir=root_dir)
     copy_best_debug = bool(dt_cfg.get("copy_best_debug", True))
     keep_items = bool(dt_cfg.get("keep_items", False))
     keep_tracks_dir = bool(dt_cfg.get("keep_tracks_dir", False))
     write_frame_table = bool(dt_cfg.get("write_frame_table", True))
     write_debug_plots = bool(dt_cfg.get("write_debug_plots", True))
+    task_output_cfg = _task_output_cfg(cfg, dt_cfg)
     track_fusion_cfg = dt_cfg.get("track_fusion", {}) if isinstance(dt_cfg.get("track_fusion"), Mapping) else {}
     track_fusion_enabled = bool(track_fusion_cfg.get("enabled", True))
     debug_dir_name = str(dt_cfg.get("debug_images_dir_name", "debug_images") or "debug_images")
@@ -239,6 +251,17 @@ def process_detected_tracks_dataset(
         code_decoder=code_decoder,
         config=runtime_cfg,
     )
+    sr_recovery_cfg = _sr_recovery_cfg(runtime_cfg, dt_cfg)
+    recovery_pipeline: Optional[PriceTagPipeline] = None
+    if bool(sr_recovery_cfg.get("enabled", False)):
+        recovery_runtime_cfg = deep_merge(runtime_cfg, dict(sr_recovery_cfg.get("config_overrides") or {}))
+        recovery_pipeline = PriceTagPipeline(
+            template_classifier=template_classifier,
+            layout_detector=layout_detector,
+            ocr_backend=ocr_backend,
+            code_decoder=code_decoder,
+            config=recovery_runtime_cfg,
+        )
     aggregator = PriceTagTrackAggregator.from_config({**dict(runtime_cfg), "track_aggregation": _force_track_aggregation_enabled(runtime_cfg)})
 
     results: List[Dict[str, Any]] = []
@@ -253,7 +276,8 @@ def process_detected_tracks_dataset(
     for numeric_track_id, track_folder in enumerate(iterator):
         track_state = TrackState(track_id=numeric_track_id)
         frame_records_for_track: List[FrameRunRecord] = []
-        for frame_index, image_path in enumerate(track_folder.images):
+        indexed_images = _indexed_track_images(track_folder.images, frame_index_cfg)
+        for frame_index, image_path in indexed_images:
             item_stem = _make_item_stem(track_folder.sequence_name, track_folder.track_id, frame_index, image_path)
             try:
                 result, obs_list, frame_record = _process_track_image(
@@ -265,6 +289,7 @@ def process_detected_tracks_dataset(
                     track_folder=track_folder,
                     frame_index=frame_index,
                     best_blur_reference=aggregator.best_blur_reference,
+                    original_coord_map=original_coord_map,
                 )
                 for obs in obs_list:
                     track_state.add(obs)
@@ -294,6 +319,25 @@ def process_detected_tracks_dataset(
                 frame_rows.append(frame_record)
                 frame_records_for_track.append(frame_record)
 
+        if track_state.observations and recovery_pipeline is not None and bool(sr_recovery_cfg.get("enabled", False)):
+            recovery_info = _maybe_run_track_sr_recovery(
+                recovery_pipeline=recovery_pipeline,
+                cfg=deep_merge(runtime_cfg, dict(sr_recovery_cfg.get("config_overrides") or {})),
+                sr_recovery_cfg=sr_recovery_cfg,
+                track_state=track_state,
+                track_folder=track_folder,
+                indexed_images=indexed_images,
+                out_dir=out_dir,
+                best_blur_reference=aggregator.best_blur_reference,
+                frame_records_for_track=frame_records_for_track,
+                global_frame_rows=frame_rows,
+                original_coord_map=original_coord_map,
+            )
+            if recovery_info.get("attempted"):
+                track_state.warnings.append("sr_recovery_attempted")
+                if recovery_info.get("added_observations", 0):
+                    track_state.warnings.append("sr_recovery_added_observations")
+
         if track_state.observations:
             split_states = aggregator.split_track_state(track_state)
             for split_index, (sub_state, split_meta) in enumerate(split_states):
@@ -321,6 +365,9 @@ def process_detected_tracks_dataset(
                         ocr_similarity_threshold=float(track_fusion_cfg.get("ocr_similarity_threshold", 0.56)),
                         ocr_strong_similarity_threshold=float(track_fusion_cfg.get("ocr_strong_similarity_threshold", 0.70)),
                         ocr_gzip_weight=float(track_fusion_cfg.get("ocr_gzip_weight", 0.55)),
+                        focus_selection_enabled=bool(track_fusion_cfg.get("focus_selection_enabled", True)),
+                        focus_score_weight=float(track_fusion_cfg.get("focus_score_weight", 0.18)),
+                        focus_roi_policy=str(track_fusion_cfg.get("focus_roi_policy", "price_tag")),
                         selected_score_boost=float(track_fusion_cfg.get("selected_score_boost", 0.22)),
                         outlier_score_penalty=float(track_fusion_cfg.get("outlier_score_penalty", 0.32)),
                     )
@@ -328,6 +375,9 @@ def process_detected_tracks_dataset(
                 aggregated = aggregator._aggregate_track(sub_state, out_dir=out_dir)  # noqa: SLF001 - public runner, same package
                 if visual_consensus_info:
                     aggregated["visual_consensus"] = visual_consensus_info
+                if getattr(sub_state, "warnings", None):
+                    aggregated.setdefault("warnings", [])
+                    aggregated["warnings"] = list(dict.fromkeys(list(aggregated.get("warnings") or []) + list(sub_state.warnings)))
                 aggregated["sequence_name"] = track_folder.sequence_name
                 aggregated["source_track_id"] = split_track_id
                 aggregated["source_track_id_original"] = track_folder.track_id
@@ -409,12 +459,20 @@ def process_detected_tracks_dataset(
         "error_count": len(errors),
         "tracks": results,
         "errors": errors,
+        "original_coordinates": original_coord_map.describe(),
     }
 
     if write_debug_plots:
         output["global_debug_plots"] = write_global_debug_plots(results, debug_plots_dir)
 
-    _write_outputs(output, table_rows, frame_rows if write_frame_table else [], out_dir, write_frame_table=write_frame_table)
+    _write_outputs(
+        output,
+        table_rows,
+        frame_rows if write_frame_table else [],
+        out_dir,
+        write_frame_table=write_frame_table,
+        task_output_cfg=task_output_cfg,
+    )
     _cleanup_optional_output_dirs(out_dir, keep_items=keep_items, keep_tracks_dir=keep_tracks_dir)
     return output
 
@@ -429,10 +487,26 @@ def _process_track_image(
     track_folder: DetectionTrackFolder,
     frame_index: int,
     best_blur_reference: float,
+    original_coord_map: Optional[OriginalCoordinateMap] = None,
 ) -> Tuple[Dict[str, Any], List[TrackObservation], FrameRunRecord]:
     image = imread_unicode(image_path)
     if image is None:
         raise RuntimeError("failed_to_read_image")
+
+    crop_h, crop_w = image.shape[:2]
+    fallback_bbox = [0, 0, max(1, int(crop_w)), max(1, int(crop_h))]
+    coord_result = (
+        original_coord_map.lookup(
+            frame_idx=frame_index,
+            tr_id=track_folder.track_id,
+            sequence_name=track_folder.sequence_name,
+            fallback_bbox=fallback_bbox,
+        )
+        if original_coord_map is not None
+        else None
+    )
+    original_bbox = list(coord_result.bbox) if coord_result is not None else list(fallback_bbox)
+    original_bbox_source = str(coord_result.source) if coord_result is not None else "crop_bbox_no_map"
 
     image_out_dir = out_dir / "items" / item_stem
     image_out_dir.mkdir(parents=True, exist_ok=True)
@@ -453,6 +527,9 @@ def _process_track_image(
             "track_dir": str(track_folder.track_dir),
             "frame_index": frame_index,
             "source_image_path": str(image_path),
+            "crop_bbox": fallback_bbox,
+            "original_bbox": original_bbox,
+            "original_bbox_source": original_bbox_source,
         },
         "input_structure": {"mode": "single_tag", "reason": "detected_track_crop"},
     }
@@ -469,6 +546,13 @@ def _process_track_image(
     result["_debug_image_path"] = str(debug_path) if debug_path.exists() else ""
 
     observations = extract_observations(result, frame_index=frame_index, best_blur_reference=best_blur_reference)
+    _apply_original_bbox_to_observations(
+        observations,
+        original_bbox=original_bbox,
+        original_bbox_source=original_bbox_source,
+        crop_bbox=fallback_bbox,
+        cfg=cfg,
+    )
     for i, obs in enumerate(observations):
         obs.observation_id = f"{safe_stem(Path(track_folder.sequence_name))}_{safe_stem(Path(track_folder.track_id))}_frame{frame_index:06d}_{i:02d}"
         obs.track_hint = f"sequence={track_folder.sequence_name} track={track_folder.track_id} frame={frame_index}"
@@ -480,6 +564,9 @@ def _process_track_image(
                 "track_dir": str(track_folder.track_dir),
                 "item_stem": item_stem,
                 "debug_image_path": result["_debug_image_path"],
+                "crop_bbox": fallback_bbox,
+                "original_bbox": original_bbox,
+                "original_bbox_source": original_bbox_source,
             }
         )
 
@@ -509,10 +596,244 @@ def _process_track_image(
         glare_applied=glare_meta.get("applied", ""),
         glare_method=str(glare_meta.get("method") or ""),
         needs_review=final.get("needs_review", ""),
+        bbox_source=original_bbox_source,
+        x_min=original_bbox[0],
+        y_min=original_bbox[1],
+        x_max=original_bbox[2],
+        y_max=original_bbox[3],
         error=str(result.get("error") or ""),
     )
     return result, observations, frame_record
 
+
+
+
+def _apply_original_bbox_to_observations(
+    observations: Sequence[TrackObservation],
+    *,
+    original_bbox: Sequence[int],
+    original_bbox_source: str,
+    crop_bbox: Sequence[int],
+    cfg: Mapping[str, Any],
+) -> None:
+    """Attach full-frame bbox to observations.
+
+    For detected-track crop datasets one track directory usually represents one
+    tag bbox in the original frame.  Therefore the default behavior is to replace
+    every observation bbox with that full-frame tag bbox.  For future rail/cell
+    modes ``coordinate_child_mode=translate_local`` can translate local child
+    bboxes by the full-frame crop origin.
+    """
+    if not observations:
+        return
+    dt_cfg = cfg.get("detected_tracks_dataset", {}) if isinstance(cfg.get("detected_tracks_dataset"), Mapping) else {}
+    ocfg = dt_cfg.get("original_coordinates", {}) if isinstance(dt_cfg.get("original_coordinates"), Mapping) else {}
+    child_mode = str(ocfg.get("coordinate_child_mode", "track_bbox") or "track_bbox").lower()
+    full = [int(round(float(x))) for x in list(original_bbox)[:4]]
+    crop = [int(round(float(x))) for x in list(crop_bbox)[:4]]
+    ox, oy = int(full[0]), int(full[1])
+    for obs in observations:
+        local_bbox = list(obs.bbox)
+        obs.raw_summary.setdefault("local_crop_bbox", local_bbox)
+        obs.raw_summary["crop_bbox"] = crop
+        obs.raw_summary["original_bbox"] = full
+        obs.raw_summary["original_bbox_source"] = original_bbox_source
+        if child_mode in {"translate", "translate_local", "child"} and obs.mode != "single_tag":
+            x1, y1, x2, y2 = [int(round(float(x))) for x in local_bbox[:4]]
+            obs.bbox = [ox + x1, oy + y1, ox + x2, oy + y2]
+            obs.raw_summary["original_bbox_mode"] = "translated_child_bbox"
+        else:
+            obs.bbox = list(full)
+            obs.raw_summary["original_bbox_mode"] = "track_bbox"
+
+
+def _sr_recovery_cfg(runtime_cfg: Mapping[str, Any], dt_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve track-level SR recovery config.
+
+    The ordinary super_resolution trigger works before OCR and can only use zone
+    class and crop geometry.  This recovery stage is deliberately track-level:
+    it runs after the light pass and enables PaddleOCR SR only when the track has
+    too few frames with a credible product-name / catalog match.
+    """
+    local = dt_cfg.get("sr_recovery", {}) if isinstance(dt_cfg.get("sr_recovery"), Mapping) else {}
+    global_cfg = runtime_cfg.get("sr_recovery", {}) if isinstance(runtime_cfg.get("sr_recovery"), Mapping) else {}
+    return deep_merge(dict(global_cfg), dict(local))
+
+
+def _maybe_run_track_sr_recovery(
+    *,
+    recovery_pipeline: PriceTagPipeline,
+    cfg: Mapping[str, Any],
+    sr_recovery_cfg: Mapping[str, Any],
+    track_state: TrackState,
+    track_folder: DetectionTrackFolder,
+    indexed_images: Sequence[Tuple[int, Path]],
+    out_dir: Path,
+    best_blur_reference: float,
+    frame_records_for_track: List[FrameRunRecord],
+    global_frame_rows: List[FrameRunRecord],
+    original_coord_map: Optional[OriginalCoordinateMap] = None,
+) -> Dict[str, Any]:
+    reason = _track_needs_sr_recovery(track_state.observations, sr_recovery_cfg)
+    if not reason.get("triggered", False):
+        return {"enabled": True, "attempted": False, "reason": reason}
+
+    max_frames = max(1, int(sr_recovery_cfg.get("max_recovery_frames", 3)))
+    score_multiplier = float(sr_recovery_cfg.get("score_multiplier", 0.92))
+    suffix = str(sr_recovery_cfg.get("item_suffix", "__srrec") or "__srrec")
+    selected = _select_sr_recovery_frames(indexed_images, track_state.observations, sr_recovery_cfg, max_frames=max_frames)
+
+    added_obs = 0
+    frame_errors: List[Dict[str, Any]] = []
+    frame_indices: List[int] = []
+    for frame_index, image_path in selected:
+        item_stem = _make_item_stem(track_folder.sequence_name, track_folder.track_id, frame_index, image_path) + suffix
+        try:
+            result, obs_list, frame_record = _process_track_image(
+                pipeline=recovery_pipeline,
+                cfg=cfg,
+                image_path=image_path,
+                out_dir=out_dir,
+                item_stem=item_stem,
+                track_folder=track_folder,
+                frame_index=frame_index,
+                best_blur_reference=best_blur_reference,
+                original_coord_map=original_coord_map,
+            )
+            frame_record.item_stem = item_stem
+            frame_record.track_key = f"{track_folder.track_key}#sr_recovery"
+            global_frame_rows.append(frame_record)
+            frame_records_for_track.append(frame_record)
+            for i, obs in enumerate(obs_list):
+                obs.observation_id = f"{obs.observation_id}_srrec_{i:02d}"
+                obs.track_hint = f"{obs.track_hint} sr_recovery=1"
+                obs.score = float(obs.score) * score_multiplier
+                obs.raw_summary.update(
+                    {
+                        "sr_recovery": True,
+                        "sr_recovery_reason": reason,
+                        "sr_recovery_item_stem": item_stem,
+                    }
+                )
+                track_state.add(obs)
+                added_obs += 1
+            frame_indices.append(int(frame_index))
+        except Exception as e:
+            frame_errors.append({"frame_index": int(frame_index), "image_path": str(image_path), "error": repr(e)})
+
+    return {
+        "enabled": True,
+        "attempted": True,
+        "reason": reason,
+        "selected_frame_indices": frame_indices,
+        "added_observations": added_obs,
+        "errors": frame_errors,
+    }
+
+
+def _track_needs_sr_recovery(observations: Sequence[TrackObservation], cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    min_good_product_frames = int(cfg.get("min_good_product_frames", 2))
+    min_good_price_frames = int(cfg.get("min_good_price_frames", 0))
+    trigger_if_product_missing = bool(cfg.get("trigger_if_product_missing", True))
+    trigger_if_price_only = bool(cfg.get("trigger_if_price_only", True))
+    min_obs = int(cfg.get("min_observations_before_recovery", 1))
+
+    good_product_frames = sorted({int(o.frame_index) for o in observations if _is_good_product_observation(o, cfg)})
+    good_price_frames = sorted({int(o.frame_index) for o in observations if _is_good_price_observation(o)})
+    has_any_price = bool(good_price_frames)
+    has_any_product = bool(good_product_frames)
+
+    reasons: List[str] = []
+    if len(observations) < min_obs:
+        return {
+            "triggered": False,
+            "reason": "too_few_observations_for_recovery_decision",
+            "num_observations": len(observations),
+            "min_observations_before_recovery": min_obs,
+        }
+    if len(good_product_frames) < min_good_product_frames:
+        reasons.append("few_good_product_frames")
+    if min_good_price_frames > 0 and len(good_price_frames) < min_good_price_frames:
+        reasons.append("few_good_price_frames")
+    if trigger_if_product_missing and not has_any_product:
+        reasons.append("product_missing")
+    if trigger_if_price_only and has_any_price and not has_any_product:
+        reasons.append("price_only_track")
+
+    return {
+        "triggered": bool(reasons),
+        "reasons": list(dict.fromkeys(reasons)),
+        "num_observations": len(observations),
+        "good_product_frames": good_product_frames,
+        "good_product_frame_count": len(good_product_frames),
+        "min_good_product_frames": min_good_product_frames,
+        "good_price_frames": good_price_frames,
+        "good_price_frame_count": len(good_price_frames),
+        "min_good_price_frames": min_good_price_frames,
+    }
+
+
+def _is_good_product_observation(obs: TrackObservation, cfg: Mapping[str, Any]) -> bool:
+    min_chars = int(cfg.get("min_product_chars", 8))
+    min_alpha = int(cfg.get("min_product_alpha_chars", 6))
+    text = str((obs.final or {}).get("product_name") or "").strip()
+    alpha_count = sum(1 for ch in text if ch.isalpha())
+    if len(text) >= min_chars and alpha_count >= min_alpha:
+        return True
+
+    pm = (obs.final or {}).get("product_match") if isinstance((obs.final or {}).get("product_match"), Mapping) else {}
+    accepted_statuses = set(str(x) for x in (cfg.get("accepted_catalog_statuses") or ["accepted", "strong_accept", "soft_accept", "price_text_soft_accept"]))
+    status = str(pm.get("status") or pm.get("source") or "")
+    score = _safe_float(pm.get("score", pm.get("text_score", 0.0)), 0.0)
+    if status in accepted_statuses and score >= float(cfg.get("min_catalog_score", 0.46)):
+        return True
+    return False
+
+
+def _is_good_price_observation(obs: TrackObservation) -> bool:
+    value = str((obs.final or {}).get("main_price") or "").strip()
+    if not value:
+        return False
+    try:
+        v = float(str(value).replace(",", "."))
+        return v > 0.0
+    except Exception:
+        return False
+
+
+def _select_sr_recovery_frames(
+    indexed_images: Sequence[Tuple[int, Path]],
+    observations: Sequence[TrackObservation],
+    cfg: Mapping[str, Any],
+    *,
+    max_frames: int,
+) -> List[Tuple[int, Path]]:
+    obs_by_frame: Dict[int, List[TrackObservation]] = {}
+    for obs in observations:
+        obs_by_frame.setdefault(int(obs.frame_index), []).append(obs)
+
+    prefer_without_product = bool(cfg.get("prefer_frames_without_product", True))
+    candidates: List[Tuple[float, int, Path]] = []
+    for frame_idx, path in indexed_images:
+        frame_obs = obs_by_frame.get(int(frame_idx), [])
+        best_score = max([float(o.score) for o in frame_obs] or [0.0])
+        good_product = any(_is_good_product_observation(o, cfg) for o in frame_obs)
+        good_price = any(_is_good_price_observation(o) for o in frame_obs)
+        score = best_score
+        if prefer_without_product and not good_product:
+            score += 0.35
+        if good_price and not good_product:
+            score += 0.18
+        candidates.append((score, int(frame_idx), path))
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return [(idx, path) for _, idx, path in candidates[:max_frames]]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
 
 def _write_track_fusion_image(
     *,
@@ -546,6 +867,22 @@ def _write_track_fusion_image(
         ocr_similarity_threshold=float(cfg.get("ocr_similarity_threshold", 0.56)),
         ocr_strong_similarity_threshold=float(cfg.get("ocr_strong_similarity_threshold", 0.70)),
         ocr_gzip_weight=float(cfg.get("ocr_gzip_weight", 0.55)),
+        focus_selection_enabled=bool(cfg.get("focus_selection_enabled", True)),
+        focus_score_weight=float(cfg.get("focus_score_weight", 0.18)),
+        focus_roi_policy=str(cfg.get("focus_roi_policy", "price_tag")),
+        min_focus_norm_for_fusion=float(cfg.get("min_focus_norm_for_fusion", 0.12)),
+        align_mode=str(cfg.get("align_mode", "phase_ecc")),
+        ecc_motion=str(cfg.get("ecc_motion", "euclidean")),
+        ecc_min_correlation=float(cfg.get("ecc_min_correlation", 0.18)),
+        phase_min_response=float(cfg.get("phase_min_response", 0.08)),
+        max_translation_ratio=float(cfg.get("max_translation_ratio", 0.22)),
+        denoise_stage=str(cfg.get("denoise_stage", "post_fusion")),
+        sr_enabled=bool(cfg.get("sr_enabled", False)),
+        sr_scale=float(cfg.get("sr_scale", 2.0)),
+        sr_stage=str(cfg.get("sr_stage", "pre_nlmeans")),
+        sr_min_side=int(cfg.get("sr_min_side", 320)),
+        sr_max_side=int(cfg.get("sr_max_side", 1400)),
+        sr_method=str(cfg.get("sr_method", "lanczos")),
     )
     out: Dict[str, Any] = dict(meta or {})
     if fused is None or fused.size == 0:
@@ -557,21 +894,60 @@ def _write_track_fusion_image(
     imwrite_unicode(out_path, fused)
     out["path"] = str(out_path)
 
+    image_variants: List[Tuple[str, np.ndarray]] = [("fused", fused)]
+    correction_meta: Dict[str, Any] = {}
+    if bool(cfg.get("tag_correction_enabled", True)):
+        for variant_name, variant_img, variant_meta in build_fused_tag_variants(fused, cfg):
+            if variant_img is None or variant_img.size == 0:
+                continue
+            image_variants.append((variant_name, variant_img))
+            correction_meta[variant_name] = variant_meta
+            if bool(cfg.get("save_tag_corrected", True)):
+                corrected_name = f"{_safe_name(track_folder.sequence_name)}__{_safe_name(track_folder.track_id)}__{variant_name}.jpg"
+                corrected_path = debug_images_dir / corrected_name
+                imwrite_unicode(corrected_path, variant_img)
+                out.setdefault("corrected_images", {})[variant_name] = str(corrected_path)
+    if correction_meta:
+        out["tag_correction"] = correction_meta
+
     decode_on_fused = bool(cfg.get("decode_codes_on_fused", True))
     only_when_missing = bool(cfg.get("decode_only_when_missing", True))
+    decode_corrected = bool(cfg.get("decode_codes_on_corrected", True))
     should_decode = decode_on_fused and ((not only_when_missing) or (not has_decoded_code(observations)))
     if should_decode:
-        codes = code_decoder.decode(fused)
-        code_debug = code_decoder.get_debug_info() if hasattr(code_decoder, "get_debug_info") else {}
-        codes_dict = [c.to_dict() for c in codes]
+        decode_variants = image_variants if decode_corrected else [("fused", fused)]
+        all_codes: List[Dict[str, Any]] = []
+        debug_by_variant: Dict[str, Any] = {}
+        for variant_name, variant_img in decode_variants:
+            codes = code_decoder.decode(variant_img)
+            code_debug = code_decoder.get_debug_info() if hasattr(code_decoder, "get_debug_info") else {}
+            debug_by_variant[variant_name] = {
+                "attempt_count": len(code_debug.get("attempts") or []),
+                "roi_count": code_debug.get("roi_count", 0),
+                "detected_count": code_debug.get("detected_count", 0),
+                "decoded_count": code_debug.get("decoded_count", 0),
+            }
+            for c in codes:
+                d = c.to_dict()
+                d["source_image_variant"] = variant_name
+                if d.get("decoder"):
+                    d["decoder"] = f"{variant_name}|{d['decoder']}"
+                all_codes.append(d)
+            if any(d.get("decoded") and str(d.get("payload") or "") for d in all_codes):
+                # A later corrected variant can still be useful, but do not burn
+                # CPU on all variants if a payload is already recovered.
+                if bool(cfg.get("stop_code_decode_after_first_payload", True)):
+                    break
+        codes_dict = _dedupe_code_dicts(all_codes)
         decoded = [c for c in codes_dict if c.get("decoded") and str(c.get("payload") or "")]
         out["code_fallback"] = {
             "enabled": True,
             "reason": "no_frame_code_decoded" if not has_decoded_code(observations) else "forced",
             "decoded_count": len(decoded),
-            "attempt_count": len(code_debug.get("attempts") or []),
-            "roi_count": code_debug.get("roi_count", 0),
-            "detected_count": code_debug.get("detected_count", len(codes_dict)),
+            "attempt_count": sum(int(v.get("attempt_count") or 0) for v in debug_by_variant.values()),
+            "roi_count": sum(int(v.get("roi_count") or 0) for v in debug_by_variant.values()),
+            "detected_count": len(codes_dict),
+            "variants": debug_by_variant,
             "codes": codes_dict,
         }
         if decoded:
@@ -585,6 +961,26 @@ def _write_track_fusion_image(
     return out
 
 
+def _dedupe_code_dicts(codes: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    decoded_first = sorted(
+        [dict(c) for c in codes],
+        key=lambda d: (not bool(d.get("decoded") and str(d.get("payload") or "")), -float(d.get("conf") or 0.0)),
+    )
+    for d in decoded_first:
+        if d.get("decoded") and str(d.get("payload") or ""):
+            key = (str(d.get("kind") or ""), str(d.get("fmt") or ""), str(d.get("payload") or ""))
+        else:
+            bbox = d.get("bbox") or []
+            key = (str(d.get("kind") or ""), tuple(round(float(x) / 12) for x in bbox) if bbox else str(d.get("decoder") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out[:16]
+
+
 def _write_best_debug_image(
     *,
     obs: TrackObservation,
@@ -594,9 +990,13 @@ def _write_best_debug_image(
     max_image_side: int = 520,
     upscale_small: bool = True,
 ) -> str:
-    # Best-track debug must be compact and readable.  Do not reuse per-frame
-    # debug images here: they contain layout boxes, OCR panels and large white
-    # padding, which makes the track review folder noisy for small crops.
+    """Write a structured review card for one aggregated price tag.
+
+    Layout requested for manual audit:
+      1. price-tag image at the top;
+      2. flat task-output fields below;
+      3. extra diagnostic information last.
+    """
     fused_meta = aggregated_track.get("fused_image") if isinstance(aggregated_track.get("fused_image"), Mapping) else {}
     fused_path = str(fused_meta.get("path") or "")
     src_image = Path(fused_path) if fused_path else Path(str(obs.image_path).split("#", 1)[0])
@@ -604,42 +1004,52 @@ def _write_best_debug_image(
     if image is None:
         return ""
 
+    task_row = build_task_output_record(aggregated_track, {
+        "fallback_frame_index_as_timestamp": True,
+        "main_price_target": "price_card",
+    })
     final = aggregated_track.get("aggregated_final") if isinstance(aggregated_track.get("aggregated_final"), Mapping) else {}
     votes = aggregated_track.get("votes") if isinstance(aggregated_track.get("votes"), Mapping) else {}
     product_match = final.get("product_match") if isinstance(final.get("product_match"), Mapping) else {}
-    warnings = aggregated_track.get("warnings") or []
+    diagnostics = aggregated_track.get("diagnostics") if isinstance(aggregated_track.get("diagnostics"), Mapping) else {}
+    validation = aggregated_track.get("validation") if isinstance(aggregated_track.get("validation"), Mapping) else {}
+    warnings = [str(w) for w in (aggregated_track.get("warnings") or [])]
 
     price_vote = votes.get("main_price") if isinstance(votes.get("main_price"), Mapping) else {}
     product_vote = votes.get("product_name") if isinstance(votes.get("product_name"), Mapping) else {}
-    price = str(final.get("main_price") or "")
-    product = str(final.get("product_name") or "")
-    status = str(aggregated_track.get("status") or "")
+    price_diag = diagnostics.get("price") if isinstance(diagnostics.get("price"), Mapping) else {}
+    product_diag = diagnostics.get("product") if isinstance(diagnostics.get("product"), Mapping) else {}
+    code_fb = fused_meta.get("code_fallback") if isinstance(fused_meta.get("code_fallback"), Mapping) else {}
 
-    lines = [
-        f"{track_folder.sequence_name}/{track_folder.track_id}  obs={aggregated_track.get('num_observations', 0)}  score={obs.score:.3f}  status={status}",
-        f"Цена: {price or '-'}    скидка: {final.get('discount_percent_raw') or '-'}    unit: {final.get('unit') or '-'}    item_id: {product_match.get('item_id') or '-'}",
-        f"Товар: {truncate_text(product, 86) if product else '-'}",
-        f"DB: {product_match.get('status') or '-'} {truncate_text(product_match.get('catalog_name') or '', 76)}",
-        f"Голоса: price_w={price_vote.get('weight', 0)} amb={price_vote.get('ambiguous', False)}; "
-        f"product_w={product_vote.get('weight', 0)} amb={product_vote.get('ambiguous', False)}",
+    extra_rows = [
+        ("track", f"{track_folder.sequence_name}/{track_folder.track_id}"),
+        ("status", str(aggregated_track.get("status") or "")),
+        ("observations", str(aggregated_track.get("num_observations") or 0)),
+        ("best_score", f"{float(obs.score):.3f}"),
+        ("price_vote", f"value={price_vote.get('value', '')} weight={price_vote.get('weight', '')} ambiguous={price_vote.get('ambiguous', False)}"),
+        ("product_vote", f"value={truncate_text(product_vote.get('value', ''), 72)} weight={product_vote.get('weight', '')} ambiguous={product_vote.get('ambiguous', False)}"),
+        ("price_consistency", f"winner_ratio={price_diag.get('winner_ratio', '')} unique={price_diag.get('unique_count', '')}"),
+        ("product_consistency", f"winner_ratio={product_diag.get('winner_ratio', '')} unique={product_diag.get('unique_count', '')}"),
+        ("catalog", f"{product_match.get('status') or '-'} item_id={product_match.get('item_id') or '-'} score={product_match.get('score') or product_match.get('text_score') or '-'}"),
+        ("catalog_name", truncate_text(product_match.get("catalog_name") or "", 110)),
+        ("validation", f"score={validation.get('score', '')} needs_review={validation.get('needs_review', '')}"),
+        ("fused", f"path={Path(fused_path).name if fused_path else '-'} frames={fused_meta.get('frame_count', '-')} code_fb={code_fb.get('decoded_count', 0) if code_fb else 0}"),
+        ("warnings", truncate_text(", ".join(warnings), 130)),
     ]
-    if fused_path:
-        code_fb = fused_meta.get("code_fallback") if isinstance(fused_meta.get("code_fallback"), Mapping) else {}
-        lines.append(
-            f"best=fused nlmeans frames={fused_meta.get('frame_count', '-')} "
-            f"code_fb={code_fb.get('decoded_count', 0) if code_fb else 0} "
-            f"attempts={code_fb.get('attempt_count', 0) if code_fb else 0}"
-        )
-    if final.get("stock_status") == "out_of_stock":
-        lines.append("Статус товара: товар закончился")
-    if warnings:
-        lines.append("warn: " + truncate_text(",".join(str(w) for w in warnings), 110))
 
-    rendered = _render_compact_track_debug(image, lines, max_image_side=max_image_side, upscale_small=upscale_small)
+    rendered = _render_structured_track_debug(
+        image,
+        title=f"{track_folder.sequence_name}/{track_folder.track_id}",
+        task_row=task_row,
+        extra_rows=extra_rows,
+        max_image_side=max_image_side,
+        upscale_small=upscale_small,
+    )
     out_name = f"{_safe_name(track_folder.sequence_name)}__{_safe_name(track_folder.track_id)}__best.jpg"
     out_path = debug_images_dir / out_name
     imwrite_unicode(out_path, rendered)
     return str(out_path)
+
 
 
 def _write_outputs(
@@ -649,10 +1059,14 @@ def _write_outputs(
     out_dir: Path,
     *,
     write_frame_table: bool = True,
+    task_output_cfg: Mapping[str, Any] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    output_dict = dict(output)
+    tracks_for_task = output_dict.get("tracks") if isinstance(output_dict.get("tracks"), list) else []
+    output_dict["task_output"] = write_task_outputs(tracks_for_task, out_dir, task_output_cfg or {})
     with open(out_dir / "detected_tracks_results.json", "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+        json.dump(output_dict, f, ensure_ascii=False, indent=2)
 
     track_dicts = [r.to_dict() for r in track_rows]
     frame_dicts = [r.to_dict() for r in frame_rows]
@@ -742,6 +1156,15 @@ def _track_table_row(track_folder: DetectionTrackFolder, aggregated: Mapping[str
 
 
 
+
+
+def _task_output_cfg(cfg: Mapping[str, Any], dt_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve flat task-output config from global and dataset sections."""
+    global_cfg = cfg.get("task_output", {}) if isinstance(cfg.get("task_output"), Mapping) else {}
+    local_cfg = dt_cfg.get("task_output", {}) if isinstance(dt_cfg.get("task_output"), Mapping) else {}
+    return deep_merge(dict(global_cfg), dict(local_cfg))
+
+
 def _runtime_cfg_for_detected_tracks(cfg: Mapping[str, Any], dt_cfg: Mapping[str, Any]) -> Dict[str, Any]:
     """Build a runtime config with detected-track-specific output policy."""
     import copy
@@ -776,6 +1199,142 @@ def _cleanup_optional_output_dirs(out_dir: Path, *, keep_items: bool, keep_track
         shutil.rmtree(out_dir / "_work_items", ignore_errors=True)
     if not keep_tracks_dir:
         shutil.rmtree(out_dir / "tracks", ignore_errors=True)
+
+
+
+
+def _render_structured_track_debug(
+    image: np.ndarray,
+    *,
+    title: str,
+    task_row: Mapping[str, Any],
+    extra_rows: Sequence[Tuple[str, str]],
+    max_image_side: int = 620,
+    upscale_small: bool = True,
+) -> np.ndarray:
+    """Render a human-readable card: tag image -> task fields -> diagnostics."""
+    if image is None or image.size == 0:
+        image = np.full((90, 220, 3), 245, dtype=np.uint8)
+    h, w = image.shape[:2]
+    max_side = max(180, int(max_image_side))
+    scale = min(1.0, max_side / max(1, max(h, w)))
+    if upscale_small and max(h, w) < 280:
+        scale = min(max_side / max(1, max(h, w)), max(2.4, 430.0 / max(1, max(h, w))))
+    if abs(scale - 1.0) > 1e-3:
+        interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+        image = cv2.resize(image, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=interp)
+    ih, iw = image.shape[:2]
+
+    panel_w = max(1040, iw + 40)
+    margin = 20
+    title_h = 46
+    image_h = ih + 2 * margin
+
+    task_fields = [
+        ("filename", "filename"),
+        ("product_name", "product_name"),
+        ("price_default", "price_default"),
+        ("price_card", "price_card"),
+        ("price_discount", "price_discount"),
+        ("barcode", "barcode"),
+        ("discount_amount", "discount_amount"),
+        ("id_sku", "id_sku"),
+        ("print_datetime", "print_datetime"),
+        ("code", "code"),
+        ("additional_info", "additional_info"),
+        ("color", "color"),
+        ("special_symbols", "special_symbols"),
+        ("frame_timestamp", "frame_timestamp"),
+        ("bbox", "bbox"),
+    ]
+    qr_fields = [
+        ("qr_code_barcode", "qr_code_barcode"),
+        ("price1_qr", "price1_qr"),
+        ("price2_qr", "price2_qr"),
+        ("price3_qr", "price3_qr"),
+        ("price4_qr", "price4_qr"),
+        ("wholesale_level_1_count", "wholesale_level_1_count"),
+        ("wholesale_level_1_price", "wholesale_level_1_price"),
+        ("wholesale_level_2_count", "wholesale_level_2_count"),
+        ("wholesale_level_2_price", "wholesale_level_2_price"),
+        ("action_price_qr", "action_price_qr"),
+        ("action_code_qr", "action_code_qr"),
+    ]
+
+    task_rows = []
+    for key, label in task_fields:
+        if key == "bbox":
+            val = f"{task_row.get('x_min','')},{task_row.get('y_min','')},{task_row.get('x_max','')},{task_row.get('y_max','')}"
+        else:
+            val = task_row.get(key, "")
+        task_rows.append((label, val))
+    qr_rows = [(label, task_row.get(key, "")) for key, label in qr_fields]
+
+    section_h_task = _section_height(len(task_rows), columns=2)
+    section_h_qr = _section_height(len(qr_rows), columns=2)
+    section_h_extra = _section_height(len(extra_rows), columns=1, value_lines=True)
+    canvas_h = title_h + image_h + section_h_task + section_h_qr + section_h_extra + margin
+    canvas = np.full((canvas_h, panel_w, 3), 255, dtype=np.uint8)
+
+    # Header.
+    cv2.rectangle(canvas, (0, 0), (panel_w - 1, title_h - 1), (245, 247, 250), -1)
+    cv2.rectangle(canvas, (0, 0), (panel_w - 1, title_h - 1), (220, 225, 232), 1)
+    canvas = _draw_text_pil(canvas, f"Ценник: {title}", (margin, 11), font_size=22, color_bgr=(20, 20, 20), bold=True)
+
+    # Top image.
+    y = title_h
+    cv2.rectangle(canvas, (0, y), (panel_w - 1, y + image_h - 1), (252, 252, 252), -1)
+    x_img = max(margin, (panel_w - iw) // 2)
+    canvas[y + margin:y + margin + ih, x_img:x_img + iw] = image
+    cv2.rectangle(canvas, (x_img, y + margin), (x_img + iw - 1, y + margin + ih - 1), (165, 165, 165), 1)
+    y += image_h
+
+    canvas, y = _draw_kv_section(canvas, y, "CSV/JSON поля", task_rows, columns=2)
+    canvas, y = _draw_kv_section(canvas, y, "Данные QR-кода", qr_rows, columns=2)
+    canvas, y = _draw_kv_section(canvas, y, "Дополнительная диагностика", extra_rows, columns=1)
+    return canvas[: min(canvas.shape[0], y + margin), :, :]
+
+
+def _section_height(n_rows: int, *, columns: int = 2, value_lines: bool = False) -> int:
+    rows_per_col = (max(1, n_rows) + max(1, columns) - 1) // max(1, columns)
+    row_h = 25 if not value_lines else 28
+    return 42 + rows_per_col * row_h + 14
+
+
+def _draw_kv_section(
+    canvas: np.ndarray,
+    y: int,
+    title: str,
+    rows: Sequence[Tuple[str, Any]],
+    *,
+    columns: int = 2,
+) -> Tuple[np.ndarray, int]:
+    h, w = canvas.shape[:2]
+    margin = 20
+    section_top = y
+    rows = list(rows)
+    rows_per_col = (max(1, len(rows)) + max(1, columns) - 1) // max(1, columns)
+    row_h = 25
+    section_h = 42 + rows_per_col * row_h + 14
+    cv2.rectangle(canvas, (margin, section_top + 8), (w - margin - 1, section_top + section_h - 1), (248, 250, 252), -1)
+    cv2.rectangle(canvas, (margin, section_top + 8), (w - margin - 1, section_top + section_h - 1), (218, 225, 235), 1)
+    canvas = _draw_text_pil(canvas, title, (margin + 12, section_top + 18), font_size=18, color_bgr=(38, 70, 105), bold=True)
+
+    col_w = (w - 2 * margin - 24) // max(1, columns)
+    y0 = section_top + 46
+    for idx, (key, value) in enumerate(rows):
+        col = idx // rows_per_col
+        row = idx % rows_per_col
+        x = margin + 12 + col * col_w
+        yy = y0 + row * row_h
+        key_text = truncate_text(str(key), 30 if columns == 1 else 27)
+        value_text = truncate_text(str(value or ""), 78 if columns == 1 else 32)
+        key_font = 14 if columns == 1 else 13
+        value_font = 14 if columns == 1 else 13
+        value_x = x + (205 if columns == 1 else 245)
+        canvas = _draw_text_pil(canvas, key_text, (x, yy), font_size=key_font, color_bgr=(80, 80, 80), bold=True)
+        canvas = _draw_text_pil(canvas, value_text, (value_x, yy), font_size=value_font, color_bgr=(15, 15, 15), bold=False)
+    return canvas, section_top + section_h
 
 
 def _render_compact_track_debug(
@@ -846,9 +1405,118 @@ def _find_observation_for_aggregated_best(observations: Sequence[TrackObservatio
             pass
     return max(observations, key=lambda o: float(o.score))
 
+
+def _frame_index_cfg(dt_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return frame-index extraction configuration.
+
+    The detected-track dataset is usually made of already-cropped frames where
+    file stems are the original video frame ids, e.g. ``6085.jpg``.  In that
+    case frame_index must be 6085, not the local 0-based position inside the
+    track folder.  This value is then used by plots, aggregation diagnostics and
+    task-output frame_timestamp conversion.
+    """
+    raw = dt_cfg.get("frame_index", {}) if isinstance(dt_cfg.get("frame_index"), Mapping) else {}
+    cfg = {
+        "source": "auto",              # auto | filename_stem | first_number | regex | enumerate
+        "regex": "",                   # optional regex with one capturing group
+        "sort_by": "frame_index",      # frame_index | natural_name | name | path
+        "strict": False,
+        "fallback": "enumerate",       # enumerate | error
+    }
+    cfg.update(dict(raw))
+    # Backward-compatible flat aliases.
+    for old_key, new_key in (
+        ("frame_index_source", "source"),
+        ("frame_index_regex", "regex"),
+        ("frame_index_sort_by", "sort_by"),
+        ("sort_images_by", "sort_by"),
+    ):
+        if old_key in dt_cfg:
+            cfg[new_key] = dt_cfg.get(old_key)
+    return cfg
+
+
+def _indexed_track_images(images: Sequence[Path], cfg: Mapping[str, Any]) -> List[Tuple[int, Path]]:
+    indexed: List[Tuple[int, int, Path]] = []
+    used: set[int] = set()
+    for ordinal, path in enumerate(images):
+        frame_idx = _extract_frame_index(path, ordinal, cfg)
+        if frame_idx in used:
+            # Duplicate numeric names are pathological for our track model. Keep
+            # deterministic uniqueness while preserving the original value scale.
+            base = int(frame_idx) * 100000 + ordinal
+            while base in used:
+                base += 1
+            frame_idx = base
+        used.add(int(frame_idx))
+        indexed.append((int(frame_idx), ordinal, path))
+
+    sort_by = str(cfg.get("sort_by") or "frame_index").lower()
+    if sort_by in {"frame_index", "frame", "numeric", "number"}:
+        indexed.sort(key=lambda x: (x[0], x[1], str(x[2]).lower()))
+    elif sort_by in {"natural", "natural_name"}:
+        indexed.sort(key=lambda x: (_natural_key(x[2].name), x[1]))
+    elif sort_by == "name":
+        indexed.sort(key=lambda x: (x[2].name.lower(), x[1]))
+    elif sort_by == "path":
+        indexed.sort(key=lambda x: (str(x[2]).lower(), x[1]))
+    # else: keep original order from _iter_track_images.
+    return [(frame_idx, path) for frame_idx, _, path in indexed]
+
+
+def _extract_frame_index(path: Path, ordinal: int, cfg: Mapping[str, Any]) -> int:
+    source = str(cfg.get("source") or "auto").lower()
+    strict = bool(cfg.get("strict", False))
+    fallback = str(cfg.get("fallback") or "enumerate").lower()
+    stem = path.stem
+
+    def fail_or_fallback(reason: str) -> int:
+        if strict or fallback == "error":
+            raise ValueError(f"cannot extract frame_index from {path}: {reason}")
+        return int(ordinal)
+
+    if source in {"enumerate", "ordinal", "local"}:
+        return int(ordinal)
+
+    regex = str(cfg.get("regex") or "").strip()
+    if source == "regex" or regex:
+        if not regex:
+            return fail_or_fallback("frame_index.source=regex but regex is empty")
+        m = re.search(regex, stem) or re.search(regex, path.name)
+        if m:
+            value = m.group(1) if m.groups() else m.group(0)
+            try:
+                return int(value)
+            except Exception:
+                return fail_or_fallback(f"regex value is not int: {value!r}")
+        if source == "regex":
+            return fail_or_fallback(f"regex did not match: {regex}")
+
+    if source in {"filename_stem", "stem", "auto"}:
+        if re.fullmatch(r"\d+", stem):
+            return int(stem)
+        if source in {"filename_stem", "stem"}:
+            return fail_or_fallback(f"stem is not an integer: {stem!r}")
+
+    if source in {"first_number", "first_int", "auto"}:
+        m = re.search(r"\d+", stem) or re.search(r"\d+", path.name)
+        if m:
+            return int(m.group(0))
+        if source in {"first_number", "first_int"}:
+            return fail_or_fallback("no integer token found")
+
+    if source == "auto":
+        return int(ordinal)
+    return fail_or_fallback(f"unknown source={source!r}")
+
+
+def _natural_key(text: str) -> Tuple[Any, ...]:
+    parts = re.split(r"(\d+)", str(text).lower())
+    return tuple(int(p) if p.isdigit() else p for p in parts)
+
 def _iter_track_images(track_dir: Path, *, recursive: bool) -> List[Path]:
     globber = track_dir.rglob if recursive else track_dir.glob
-    return sorted([p for p in globber("*") if p.is_file() and p.suffix.lower() in IMG_EXTS])
+    return sorted([p for p in globber("*") if p.is_file() and p.suffix.lower() in IMG_EXTS], key=lambda p: _natural_key(p.name))
 
 
 def _make_item_stem(sequence_name: str, track_id: str, frame_index: int, image_path: Path) -> str:

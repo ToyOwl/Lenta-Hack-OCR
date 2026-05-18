@@ -24,6 +24,8 @@ import numpy as np
 from .io_utils import imread_unicode
 from .product_card import normalize_price_value
 from .track_aggregator import TrackObservation
+from .tag_qr_enhancement import super_resolve_crop
+from .focus_metrics import compute_focus_quality, normalize_focus_scores, summarize_focus
 
 
 @dataclass
@@ -43,6 +45,9 @@ class _FrameCandidate:
     ocr_sim_to_reference: float = 0.0
     ocr_cluster_centrality: float = 0.0
     ocr_knn_support: float = 0.0
+    focus_score: float = 0.0
+    focus_norm: float = 0.0
+    focus_metrics: dict[str, Any] | None = None
     fusion_score: float = 0.0
 
 
@@ -61,6 +66,9 @@ def apply_track_consensus_scores(
     ocr_similarity_threshold: float = 0.56,
     ocr_strong_similarity_threshold: float = 0.70,
     ocr_gzip_weight: float = 0.55,
+    focus_selection_enabled: bool = True,
+    focus_score_weight: float = 0.18,
+    focus_roi_policy: str = "price_tag",
     selected_score_boost: float = 0.22,
     outlier_score_penalty: float = 0.32,
     update_raw_summary: bool = True,
@@ -94,6 +102,9 @@ def apply_track_consensus_scores(
         ocr_similarity_threshold=ocr_similarity_threshold,
         ocr_strong_similarity_threshold=ocr_strong_similarity_threshold,
         ocr_gzip_weight=ocr_gzip_weight,
+        focus_selection_enabled=focus_selection_enabled,
+        focus_score_weight=focus_score_weight,
+        focus_roi_policy=focus_roi_policy,
     )
     if not candidates:
         return meta
@@ -128,6 +139,8 @@ def apply_track_consensus_scores(
                     "ocr_sim_to_reference": round(float(cand.ocr_sim_to_reference), 4),
                     "ocr_cluster_centrality": round(float(cand.ocr_cluster_centrality), 4),
                     "ocr_knn_support": round(float(cand.ocr_knn_support), 4),
+                    "focus_score": round(float(cand.focus_score), 4),
+                    "focus_norm": round(float(cand.focus_norm), 4),
                     "ocr_text_short": cand.ocr_text[:96],
                 }
             )
@@ -136,8 +149,9 @@ def apply_track_consensus_scores(
                 # a slightly weaker but very stable frame overtake a sharp outlier.
                 sim = max(0.0, min(1.0, float(cand.sim_to_reference)))
                 central = max(0.0, min(1.0, float(cand.cluster_centrality)))
-                multiplier = 1.0 + float(selected_score_boost) * (0.35 + 0.45 * sim + 0.20 * central)
-                new_score = min(1.0, old_score * multiplier + 0.035 * sim)
+                focus = max(0.0, min(1.0, float(cand.focus_norm)))
+                multiplier = 1.0 + float(selected_score_boost) * (0.28 + 0.38 * sim + 0.18 * central + 0.16 * focus)
+                new_score = min(1.0, old_score * multiplier + 0.030 * sim + 0.018 * focus)
             elif selected_active and cluster_count > 1:
                 new_score = max(0.0, old_score * max(0.05, 1.0 - float(outlier_score_penalty)))
         elif selected_active and cluster_count > 1:
@@ -189,6 +203,22 @@ def fuse_track_images(
     ocr_similarity_threshold: float = 0.56,
     ocr_strong_similarity_threshold: float = 0.70,
     ocr_gzip_weight: float = 0.55,
+    focus_selection_enabled: bool = True,
+    focus_score_weight: float = 0.18,
+    focus_roi_policy: str = "price_tag",
+    min_focus_norm_for_fusion: float = 0.12,
+    align_mode: str = "phase_ecc",
+    ecc_motion: str = "euclidean",
+    ecc_min_correlation: float = 0.18,
+    phase_min_response: float = 0.08,
+    max_translation_ratio: float = 0.22,
+    denoise_stage: str = "post_fusion",
+    sr_enabled: bool = False,
+    sr_scale: float = 2.0,
+    sr_stage: str = "pre_nlmeans",
+    sr_min_side: int = 320,
+    sr_max_side: int = 1400,
+    sr_method: str = "lanczos",
 ) -> Tuple[np.ndarray | None, dict[str, Any]]:
     """Return a fused/denoised image and metadata for a track.
 
@@ -225,6 +255,9 @@ def fuse_track_images(
             ocr_similarity_threshold=ocr_similarity_threshold,
             ocr_strong_similarity_threshold=ocr_strong_similarity_threshold,
             ocr_gzip_weight=ocr_gzip_weight,
+            focus_selection_enabled=focus_selection_enabled,
+            focus_score_weight=focus_score_weight,
+            focus_roi_policy=focus_roi_policy,
         )
         selected_cluster_id = consensus_meta.get("selected_cluster_id")
         if candidates and selected_cluster_id is not None and int(consensus_meta.get("selected_cluster_size") or 0) >= int(min_cluster_size):
@@ -258,6 +291,20 @@ def fuse_track_images(
         return None, {"enabled": True, "status": "reference_read_failed", "reference_image": ref.image_path, "visual_consensus": consensus_meta}
 
     ref_img, scale = _downscale_if_needed(ref_img, max_work_side=max_work_side)
+    sr_meta: dict[str, Any] = {"enabled": bool(sr_enabled), "stage": str(sr_stage or "pre_nlmeans")}
+    sr_stage_l = str(sr_stage or "pre_nlmeans").lower().strip()
+    sr_pre = bool(sr_enabled) and sr_stage_l in {"pre", "pre_nlmeans", "before_nlmeans", "both"}
+    sr_post = bool(sr_enabled) and sr_stage_l in {"post", "post_fusion", "after_fusion", "both"}
+    if sr_pre:
+        ref_img, sr_ref_meta = super_resolve_crop(
+            ref_img,
+            enabled=True,
+            scale=float(sr_scale),
+            min_side=int(sr_min_side),
+            max_side=int(sr_max_side),
+            method=str(sr_method or "lanczos"),
+        )
+        sr_meta["reference"] = sr_ref_meta
     ref_h, ref_w = ref_img.shape[:2]
     candidates_obs = list(selected_obs)
     if ref not in candidates_obs:
@@ -277,29 +324,45 @@ def fuse_track_images(
     weights: list[float] = []
     align_failures = 0
     source_paths: list[str] = []
-    ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+    ref_gray = _alignment_gray(ref_img)
+    denoise_stage_l = str(denoise_stage or "post_fusion").lower().strip()
+    denoise_pre = denoise_stage_l in {"pre", "pre_frame", "pre_fusion", "both"}
+    denoise_post = denoise_stage_l in {"post", "post_fusion", "after_fusion", "both"}
 
     for o in candidates_obs[: max(1, int(max_images))]:
         img = _read_observation_image(o)
         if img is None or img.size == 0:
             continue
         img = cv2.resize(img, (ref_w, ref_h), interpolation=cv2.INTER_AREA if max(img.shape[:2]) > max(ref_h, ref_w) else cv2.INTER_CUBIC)
+        focus_norm = _obs_focus_norm(o, default=1.0 if o is ref else 0.55)
+        if o is not ref and focus_selection_enabled and focus_norm < float(min_focus_norm_for_fusion) and len(candidates_obs) > 2:
+            align_failures += 1
+            continue
         if align and img.shape[:2] == ref_img.shape[:2] and o is not ref:
-            ok, warped = _align_translation_ecc(img, ref_gray)
+            ok, warped, align_info = _align_image_to_reference(
+                img,
+                ref_gray,
+                mode=str(align_mode or "phase_ecc"),
+                ecc_motion=str(ecc_motion or "euclidean"),
+                ecc_min_correlation=float(ecc_min_correlation),
+                phase_min_response=float(phase_min_response),
+                max_translation_ratio=float(max_translation_ratio),
+            )
             if ok:
                 img = warped
             else:
                 align_failures += 1
-        img = _safe_nlmeans(
-            img,
-            h=float(denoise_h),
-            h_color=float(denoise_h_color),
-            template_window_size=int(template_window_size),
-            search_window_size=int(search_window_size),
-        )
+        if denoise_pre:
+            img = _safe_nlmeans(
+                img,
+                h=float(denoise_h),
+                h_color=float(denoise_h_color),
+                template_window_size=int(template_window_size),
+                search_window_size=int(search_window_size),
+            )
         aligned.append(img)
         sim = max(0.0, min(1.0, float(sim_by_id.get(id(o), 1.0 if o is ref else 0.72))))
-        weights.append(max(0.03, float(o.score)) * (0.55 + 0.45 * sim))
+        weights.append(max(0.03, float(o.score)) * (0.48 + 0.32 * sim + 0.20 * max(0.0, min(1.0, focus_norm))))
         source_paths.append(str(o.image_path))
 
     if not aligned:
@@ -315,20 +378,48 @@ def fuse_track_images(
     else:
         fused = mean_img
     fused_u8 = np.clip(fused, 0, 255).astype(np.uint8)
+    if denoise_post:
+        fused_u8 = _safe_nlmeans(
+            fused_u8,
+            h=float(denoise_h),
+            h_color=float(denoise_h_color),
+            template_window_size=int(template_window_size),
+            search_window_size=int(search_window_size),
+        )
+    if sr_post and not sr_pre:
+        fused_u8, sr_post_meta = super_resolve_crop(
+            fused_u8,
+            enabled=True,
+            scale=float(sr_scale),
+            min_side=int(sr_min_side),
+            max_side=int(sr_max_side),
+            method=str(sr_method or "lanczos"),
+        )
+        sr_meta["post_fusion"] = sr_post_meta
     fused_u8 = _unsharp(fused_u8)
+
+    method_name = "visual_ocr_knn_gzip_consensus_sr_nlmeans_aligned_weighted_median_mean" if sr_pre else "visual_ocr_knn_gzip_consensus_nlmeans_aligned_weighted_median_mean"
+    if sr_post and not sr_pre:
+        method_name = "visual_ocr_knn_gzip_consensus_nlmeans_aligned_weighted_median_mean_post_sr"
 
     meta = {
         "enabled": True,
         "status": "ok",
-        "method": "visual_ocr_knn_gzip_consensus_nlmeans_aligned_weighted_median_mean",
+        "method": method_name,
         "frame_count": len(aligned),
         "source_count": len(candidates_obs),
         "align_enabled": bool(align),
+        "align_mode": str(align_mode),
+        "ecc_motion": str(ecc_motion),
         "align_failures": int(align_failures),
+        "denoise_stage": str(denoise_stage),
+        "focus_selection_enabled": bool(focus_selection_enabled),
+        "focus_min_norm_for_fusion": float(min_focus_norm_for_fusion),
         "reference_policy": reference_policy,
         "reference_frame_index": int(ref.frame_index),
         "reference_image": str(ref.image_path),
         "reference_scale": round(float(scale), 4),
+        "sr": sr_meta,
         "output_shape": list(fused_u8.shape),
         "source_images": source_paths[:12],
         "visual_consensus": consensus_meta,
@@ -359,6 +450,9 @@ def _build_visual_consensus(
     ocr_similarity_threshold: float = 0.56,
     ocr_strong_similarity_threshold: float = 0.70,
     ocr_gzip_weight: float = 0.55,
+    focus_selection_enabled: bool = True,
+    focus_score_weight: float = 0.18,
+    focus_roi_policy: str = "price_tag",
 ) -> tuple[list[_FrameCandidate], dict[str, Any]]:
     obs_sorted = sorted([o for o in observations if isinstance(o, TrackObservation)], key=lambda o: float(o.score), reverse=True)
     obs_sorted = obs_sorted[: max(1, int(max_candidates))]
@@ -375,6 +469,7 @@ def _build_visual_consensus(
             unreadable += 1
             continue
         ocr_text = _obs_ocr_text(obs)
+        fq = compute_focus_quality(img, roi_policy=str(focus_roi_policy or "price_tag")) if focus_selection_enabled else None
         candidates.append(
             _FrameCandidate(
                 obs=obs,
@@ -386,17 +481,21 @@ def _build_visual_consensus(
                 template_name=_obs_template(obs),
                 ocr_text=ocr_text,
                 ocr_feature=_ocr_embedding(ocr_text, dim=int(ocr_embedding_dim)) if ocr_similarity_enabled else None,
+                focus_score=float(fq.score) if fq is not None else 0.0,
+                focus_metrics=fq.to_dict() if fq is not None else None,
             )
         )
 
     if not candidates:
         return [], {"enabled": True, "status": "no_readable_images", "candidate_count": 0, "unreadable_count": int(unreadable)}
+    _assign_focus_norms(candidates)
+
     if len(candidates) == 1:
         c = candidates[0]
         c.cluster_id = 0
         c.sim_to_reference = 1.0
         c.cluster_centrality = 1.0
-        c.fusion_score = float(c.original_score)
+        c.fusion_score = float(c.original_score) + float(focus_score_weight) * float(c.focus_norm)
         return candidates, {
             "enabled": True,
             "status": "single_candidate",
@@ -499,11 +598,13 @@ def _build_visual_consensus(
         product_ratio = _dominant_ratio([m.product_norm for m in members if m.product_norm])
         template_ratio = _dominant_ratio([m.template_name for m in members if m.template_name])
         score_sum = sum(max(0.03, float(m.original_score)) for m in members)
+        focus_mean = float(np.mean([max(0.0, min(1.0, m.focus_norm)) for m in members])) if members else 0.0
+        best_focus = max((float(m.focus_norm) for m in members), default=0.0)
         best_raw = max(float(m.original_score) for m in members)
         agreement = max(price_ratio, product_ratio, template_ratio)
         ocr_bonus = 0.08 * min(1.0, ocr_centrality) if ocr_similarity_enabled else 0.0
         size_bonus = min(0.20, 0.045 * max(0, len(members) - 1))
-        cluster_score = score_sum * (0.54 + 0.30 * centrality + 0.10 * agreement + ocr_bonus) + best_raw * 0.12 + size_bonus
+        cluster_score = score_sum * (0.50 + 0.26 * centrality + 0.09 * agreement + ocr_bonus + float(focus_score_weight) * 0.45 * focus_mean) + best_raw * 0.10 + best_focus * float(focus_score_weight) * 0.22 + size_bonus
         cluster_scores.append((cluster_id, float(cluster_score)))
         cluster_infos.append(_cluster_meta(cluster_id, members, centrality=centrality, cluster_score=cluster_score, ocr_centrality=ocr_centrality))
 
@@ -531,7 +632,8 @@ def _build_visual_consensus(
             ev_bonus += 0.025
         if c.ocr_text:
             ev_bonus += 0.025 * max(0.0, min(1.0, ocr_centrality_to_cluster))
-        ref_score = float(c.original_score) * (0.52 + 0.38 * centrality_to_cluster + 0.10 * max(0.0, min(1.0, ocr_centrality_to_cluster))) + ev_bonus
+        focus_bonus = float(focus_score_weight) * max(0.0, min(1.0, float(c.focus_norm)))
+        ref_score = float(c.original_score) * (0.48 + 0.34 * centrality_to_cluster + 0.09 * max(0.0, min(1.0, ocr_centrality_to_cluster)) + 0.09 * max(0.0, min(1.0, float(c.focus_norm)))) + ev_bonus + focus_bonus
         if ref_score > best_ref_score:
             best_ref_score = ref_score
             ref_idx = idx
@@ -556,7 +658,7 @@ def _build_visual_consensus(
             evidence_bonus += 0.04
         if c.ocr_text:
             evidence_bonus += 0.035 * max(c.ocr_sim_to_reference, c.ocr_cluster_centrality)
-        c.fusion_score = float(c.original_score) * (0.48 + 0.28 * c.sim_to_reference + 0.16 * c.cluster_centrality + 0.08 * max(c.ocr_sim_to_reference, c.ocr_cluster_centrality)) + evidence_bonus
+        c.fusion_score = float(c.original_score) * (0.44 + 0.25 * c.sim_to_reference + 0.14 * c.cluster_centrality + 0.07 * max(c.ocr_sim_to_reference, c.ocr_cluster_centrality) + 0.10 * max(0.0, min(1.0, c.focus_norm))) + evidence_bonus + float(focus_score_weight) * 0.18 * max(0.0, min(1.0, c.focus_norm))
 
     selected_size = len(selected_indices)
     status = "ok" if selected_size >= int(min_cluster_size) else "no_cluster_above_min_size"
@@ -580,6 +682,10 @@ def _build_visual_consensus(
         "ocr_similarity_threshold": float(ocr_similarity_threshold),
         "ocr_strong_similarity_threshold": float(ocr_strong_similarity_threshold),
         "ocr_gzip_weight": float(ocr_gzip_weight),
+        "focus_selection_enabled": bool(focus_selection_enabled),
+        "focus_score_weight": float(focus_score_weight),
+        "focus_roi_policy": str(focus_roi_policy),
+        "focus_summary": summarize_focus([c.focus_metrics or {"score": c.focus_score, "qr_score": 0.0} for c in candidates]),
         "clusters": cluster_infos[:10],
     }
 
@@ -608,6 +714,9 @@ def _cluster_meta(
         "price_ratio": round(float(_dominant_ratio(prices)), 4),
         "product_ratio": round(float(_dominant_ratio(products)), 4),
         "template_ratio": round(float(_dominant_ratio(templates)), 4),
+        "focus_mean": round(float(np.mean([m.focus_norm for m in members])) if members else 0.0, 4),
+        "focus_best": round(float(max((m.focus_norm for m in members), default=0.0)), 4),
+        "qr_focus_best": round(float(max((float((m.focus_metrics or {}).get("qr_score", 0.0)) for m in members), default=0.0)), 4),
     }
     if centrality is not None:
         out["visual_centrality"] = round(float(centrality), 4)
@@ -912,17 +1021,126 @@ def _downscale_if_needed(image: np.ndarray, *, max_work_side: int) -> tuple[np.n
     return resized, scale
 
 
-def _align_translation_ecc(image: np.ndarray, ref_gray: np.ndarray) -> tuple[bool, np.ndarray]:
+def _alignment_gray(image: np.ndarray) -> np.ndarray:
     try:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        warp = np.eye(2, 3, dtype=np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 35, 1e-4)
-        cv2.findTransformECC(ref_gray, gray, warp, cv2.MOTION_TRANSLATION, criteria, None, 5)
-        h, w = ref_gray.shape[:2]
-        aligned = cv2.warpAffine(image, warp, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
-        return True, aligned
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        return gray.astype(np.float32) / 255.0
     except Exception:
-        return False, image
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+        return gray.astype(np.float32) / 255.0
+
+
+def _align_image_to_reference(
+    image: np.ndarray,
+    ref_gray: np.ndarray,
+    *,
+    mode: str = "phase_ecc",
+    ecc_motion: str = "euclidean",
+    ecc_min_correlation: float = 0.18,
+    phase_min_response: float = 0.08,
+    max_translation_ratio: float = 0.22,
+) -> tuple[bool, np.ndarray, dict[str, Any]]:
+    info: dict[str, Any] = {"mode": str(mode), "ecc_motion": str(ecc_motion)}
+    try:
+        img_gray = _alignment_gray(image)
+        h, w = ref_gray.shape[:2]
+        if img_gray.shape[:2] != (h, w):
+            img_gray = cv2.resize(img_gray, (w, h), interpolation=cv2.INTER_AREA)
+        mode_l = str(mode or "phase_ecc").lower().strip()
+        motion_l = str(ecc_motion or "euclidean").lower().strip()
+
+        warp = _identity_warp(motion_l)
+        phase_ok = False
+        if mode_l in {"phase", "phase_ecc", "phase+ecc", "ecc_phase"}:
+            try:
+                win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+                (dx, dy), response = cv2.phaseCorrelate(ref_gray.astype(np.float32), img_gray.astype(np.float32), win)
+                info["phase_dx"] = round(float(dx), 4)
+                info["phase_dy"] = round(float(dy), 4)
+                info["phase_response"] = round(float(response), 6)
+                max_shift = float(max_translation_ratio) * float(max(h, w))
+                if abs(float(dx)) <= max_shift and abs(float(dy)) <= max_shift and float(response) >= float(phase_min_response):
+                    warp[0, 2] = float(dx)
+                    warp[1, 2] = float(dy)
+                    phase_ok = True
+            except Exception as e:
+                info["phase_error"] = type(e).__name__
+
+        if mode_l == "phase":
+            if not phase_ok:
+                return False, image, info
+            return True, _warp_with_matrix(image, warp, motion_l, (w, h)), info
+
+        if mode_l in {"none", "off", "disabled"}:
+            return True, image, info
+
+        motion = _cv_motion(motion_l)
+        if motion == cv2.MOTION_HOMOGRAPHY and warp.shape != (3, 3):
+            w3 = np.eye(3, dtype=np.float32)
+            w3[:2, :] = warp[:2, :]
+            warp = w3
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5)
+        cc, warp = cv2.findTransformECC(ref_gray, img_gray, warp.astype(np.float32), motion, criteria, None, 5)
+        info["ecc_correlation"] = round(float(cc), 6)
+        if float(cc) < float(ecc_min_correlation):
+            if phase_ok:
+                info["fallback"] = "phase_only_low_ecc"
+                return True, _warp_with_matrix(image, _identity_warp("translation", tx=info.get("phase_dx", 0.0), ty=info.get("phase_dy", 0.0)), "translation", (w, h)), info
+            return False, image, info
+        return True, _warp_with_matrix(image, warp, motion_l, (w, h)), info
+    except Exception as e:
+        info["error"] = type(e).__name__
+        return False, image, info
+
+
+def _identity_warp(motion_l: str, *, tx: float = 0.0, ty: float = 0.0) -> np.ndarray:
+    if str(motion_l).lower().strip() == "homography":
+        w = np.eye(3, dtype=np.float32)
+        w[0, 2] = float(tx)
+        w[1, 2] = float(ty)
+        return w
+    w = np.eye(2, 3, dtype=np.float32)
+    w[0, 2] = float(tx)
+    w[1, 2] = float(ty)
+    return w
+
+
+def _cv_motion(motion_l: str) -> int:
+    motion_l = str(motion_l or "euclidean").lower().strip()
+    if motion_l in {"translation", "trans"}:
+        return cv2.MOTION_TRANSLATION
+    if motion_l in {"affine"}:
+        return cv2.MOTION_AFFINE
+    if motion_l in {"homography", "perspective"}:
+        return cv2.MOTION_HOMOGRAPHY
+    return cv2.MOTION_EUCLIDEAN
+
+
+def _warp_with_matrix(image: np.ndarray, warp: np.ndarray, motion_l: str, size: tuple[int, int]) -> np.ndarray:
+    w, h = int(size[0]), int(size[1])
+    if warp.shape == (3, 3) or str(motion_l).lower().strip() == "homography":
+        mat = warp if warp.shape == (3, 3) else np.vstack([warp, np.array([[0, 0, 1]], dtype=np.float32)])
+        return cv2.warpPerspective(image, mat, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
+    return cv2.warpAffine(image, warp[:2, :], (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
+
+
+def _obs_focus_norm(obs: TrackObservation, *, default: float = 0.5) -> float:
+    try:
+        vc = (obs.raw_summary or {}).get("visual_consensus") if isinstance(obs.raw_summary, Mapping) else None
+        if isinstance(vc, Mapping) and vc.get("focus_norm") is not None:
+            return max(0.0, min(1.0, float(vc.get("focus_norm"))))
+    except Exception:
+        pass
+    return float(default)
+
+
+def _assign_focus_norms(candidates: Sequence[_FrameCandidate]) -> None:
+    vals = normalize_focus_scores([c.focus_metrics or {"score": c.focus_score} for c in candidates], key="score")
+    for c, v in zip(candidates, vals):
+        c.focus_norm = float(max(0.0, min(1.0, v)))
 
 
 def _safe_nlmeans(

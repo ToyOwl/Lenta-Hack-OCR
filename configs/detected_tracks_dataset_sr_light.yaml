@@ -1,0 +1,373 @@
+io:
+  input_dir: D:/dev/datasets/toy-dataset-2
+  out_dir: runs/detected_tracks_dataset_sr_light
+  recursive: true
+output:
+  save_debug: true
+  save_crops: true
+  write_item_json: true
+  write_summary_json: true
+  write_summary_tsv: true
+task_output:
+  enabled: true
+  csv_name: detected_tracks_task_output.csv
+  json_name: detected_tracks_task_output.json
+  absent_value: нет
+  empty_value: ''
+  main_price_target: price_card
+  video_fps: 0.0
+  fallback_frame_index_as_timestamp: false
+  visible_color:
+    infer_from_best_image: true
+    prefer_visual_yellow: true
+    yellow_min_ratio: 0.16
+    red_min_ratio: 0.22
+    yellow_over_red: 0.72
+quality:
+  min_width: 120
+  min_height: 80
+  blur_warn: 60.0
+color_names:
+  backend: lab_soft
+  lut_path: w2c.npy
+  temperature: 950.0
+  max_pixels: 80000
+  w2c_index_order: rgb_fast
+detected_tracks_dataset:
+  root_dir: D:/dev/datasets/toy-dataset-2
+  out_dir: runs/detected_tracks_dataset_sr_light
+  recursive_images_in_track: false
+  min_images_per_track: 1
+  skip_hidden: true
+  frame_index:
+    source: filename_stem
+    regex: ''
+    sort_by: frame_index
+    strict: false
+    fallback: enumerate
+  original_coordinates:
+    enabled: false
+    csv_path: ''
+    frame_col: frame_idx
+    track_col: tr_id
+    xyxy_col: xyxy
+    delimiter: auto
+    encoding: utf-8-sig
+    strict: false
+    fallback_to_crop_bbox: true
+    coordinate_child_mode: track_bbox
+    auto_find: false
+    auto_find_names:
+    - original_coordinates.csv
+    - detections.csv
+    - tracks.csv
+    - bboxes.csv
+  copy_best_debug: true
+  debug_images_dir_name: debug_images
+  debug_plots_dir_name: debug_plots
+  debug_max_image_side: 520
+  debug_upscale_small: true
+  write_debug_plots: true
+  keep_items: false
+  keep_tracks_dir: false
+  save_frame_debug: true
+  save_frame_crops: false
+  write_frame_json: true
+  write_frame_table: true
+  sr_recovery:
+    enabled: false
+  track_fusion:
+    enabled: false
+    max_images: 5
+    max_work_side: 760
+    align: false
+    align_mode: none
+    denoise_stage: none
+    denoise_h: 0.0
+    denoise_h_color: 0.0
+    template_window_size: 7
+    search_window_size: 21
+    score_consensus_enabled: true
+    fusion_consensus_enabled: false
+    consensus_max_candidates: 24
+    consensus_feature_size: 64
+    visual_similarity_threshold: 0.66
+    evidence_similarity_threshold: 0.5
+    min_cluster_size: 2
+    ocr_similarity_enabled: true
+    ocr_embedding_dim: 384
+    ocr_knn_k: 4
+    ocr_similarity_threshold: 0.56
+    ocr_strong_similarity_threshold: 0.7
+    ocr_gzip_weight: 0.55
+    focus_selection_enabled: true
+    focus_score_weight: 0.18
+    focus_roi_policy: price_tag
+    min_focus_norm_for_fusion: 0.12
+    selected_score_boost: 0.18
+    outlier_score_penalty: 0.25
+    ecc_motion: euclidean
+    ecc_min_correlation: 0.18
+    phase_min_response: 0.08
+    max_translation_ratio: 0.22
+    sr_enabled: false
+    sr_scale: 2.0
+    sr_stage: post_fusion
+    sr_min_side: 320
+    sr_max_side: 1200
+    sr_method: lanczos
+    tag_correction_enabled: false
+    save_tag_corrected: false
+    tag_correction_profile: safe
+    tag_correction_sr_enabled: false
+    tag_correction_clahe_clip: 1.75
+    tag_correction_text_gain: 0.16
+    tag_correction_red_zone_gain: 0.04
+    tag_correction_glare_suppression: true
+    tag_correction_gray_world_strength: 0.2
+    tag_correction_glare_max_area_ratio: 0.035
+    tag_correction_blackhat_kernel_ratio: 0.018
+    tag_correction_final_unsharp_amount: 0.06
+    decode_codes_on_fused: false
+    decode_codes_on_corrected: false
+    decode_only_when_missing: true
+    stop_code_decode_after_first_payload: true
+track_aggregation:
+  enabled: true
+  best_blur_reference: 160.0
+  price_vote_boost: 1.35
+  product_vote_boost: 1.05
+  ambiguity_ratio: 0.84
+  copy_best_frames: false
+  min_product_chars: 4
+  price_only_ok: true
+  prefer_larger_decimal_shift: true
+  decimal_shift_alias_enabled: true
+  decimal_shift_min_larger_price: 5.0
+  digit_flip_alias_enabled: true
+  split_mixed_tracks: true
+  split_min_segment_observations: 2
+  split_min_price_support: 2
+  split_min_reliable_score: 0.72
+  split_price_gap_ratio: 0.16
+  split_product_token_overlap: 0.34
+  false_tag_filter_enabled: true
+  false_tag_reject_score: 0.68
+  false_tag_review_score: 0.45
+  false_tag_max_tall_aspect: 0.62
+  false_tag_large_area: 120000
+  false_tag_min_reasonable_price: 2.0
+  unstable_price_consistency_review: 0.58
+  unstable_price_unique_reject: 4
+  catalog_gate_enabled: true
+  catalog_reject_on_review: true
+  catalog_min_text_score_for_track_accept: 0.5
+  catalog_min_price_consistency_for_track_accept: 0.62
+  catalog_min_product_consistency_for_track_accept: 0.62
+  debug: false
+input_structure:
+  mode: single_tag
+  save_debug: false
+rail_segmentation:
+  enabled: true
+  process_cells: false
+  save_rail_debug: false
+  save_cell_crops: false
+tilt_corrector:
+  enabled: true
+  coarse_step: 1.0
+  fine_step: 0.2
+  angle_range: 35.0
+  min_text_height: 12
+  min_abs_angle: 1.2
+  max_work_side: 900
+  save_tilt_debug: false
+  apply_before_structure: false
+  apply_before_rail: false
+  apply_to_rail_cells: true
+  debug: false
+glare_suppression:
+  enabled: true
+  method: hybrid
+  blend_alpha: 0.72
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: 8
+  glare_v_threshold: 210
+  glare_s_threshold: 72
+  glare_min_area_ratio: 0.002
+  glare_dilate_px: 2
+  inpaint_radius: 3.0
+  dcp_patch_size: 9
+  dcp_omega: 0.78
+  dcp_t0: 0.22
+  dcp_guided_blur: 9
+  max_work_side: 720
+  save_debug: false
+  debug: false
+code_decoder:
+  enabled: true
+  use_pyzbar: true
+  try_opencv_qr: true
+  qr_roi_scan: true
+  preprocessing_variants: true
+  keep_undecoded_qr: true
+  qr_sr_enabled: true
+  qr_sr_scale: 2.0
+  qr_sr_min_side: 420
+  qr_sr_max_side: 1400
+  qr_sr_method: lanczos
+  qr_perspective_warp: true
+  qr_morphology: true
+  max_rois: 6
+  max_variants_per_roi: 10
+  qr_contour_max_rois: 4
+ocr:
+  backend: paddle
+  batch_inference: true
+  batch_size: 16
+  min_batch_jobs: 2
+  gpu: true
+  full_tag_ocr: true
+  debug: false
+  paddle:
+    lang: ru
+    ocr_version: PP-OCRv5
+    engine: ''
+    use_angle_cls: true
+    text_detection_model_name: PP-OCRv5_mobile_det
+    text_recognition_model_name: eslav_PP-OCRv5_mobile_rec
+    input_mode: ndarray
+    mkldnn: false
+    pir_api: false
+    rec_model_dir: ''
+    det_model_dir: ''
+    cls_model_dir: ''
+price_parser:
+  allow_compact_in_main_price_zones: true
+  allow_compact_in_full_tag: false
+spatial_parser:
+  enabled: true
+  draw_semantic_boxes: true
+  draw_full_ocr: true
+  product_as_ocr_prior: true
+llm_corrector:
+  backend: none
+csv_corrector:
+  enabled: true
+  path: goods.csv
+  top_k: 8
+  min_text_score: 0.26
+  min_accept_score: 0.58
+  allow_price_correction: true
+  allow_price_only_match: true
+  allow_price_only_autofill: false
+  force_catalog_price_when_matched: false
+  max_price_conflict_ratio: 0.12
+  max_price_only_candidates: 5
+  include_raw_row: false
+  allow_close_family_match: true
+  family_match_min_name_overlap: 0.72
+  family_match_min_price_score: 0.92
+  min_text_score_with_price: 0.46
+  min_price_score_for_soft_accept: 0.94
+  reject_weak_query_text: true
+  min_query_content_tokens: 2
+  min_query_alpha_chars: 8
+  min_product_text_score_for_autofill: 0.48
+  retain_candidate_match: true
+  strong_text_accept_score: 0.48
+  debug: false
+  catalog:
+    path: goods.csv
+    name_column: name
+    item_id_column: item_id
+    category_id_column: category_id
+    brand_column: brand
+    category_column: category_name
+    unit_column: unit
+    quantity_column: quantity
+    price_columns:
+    - price
+    - price_regular
+    - cost
+    - cost_regular
+    top_k: 8
+    min_text_score: 0.26
+    min_accept_score: 0.58
+    max_rows: 250000
+    fuzzy_token_match: true
+    min_fuzzy_token_score: 0.74
+    max_candidate_rows: 20000
+zones:
+  code_classes:
+  - qr_code
+  - linear_barcode
+  - barcode
+  - datamatrix
+  ocr_exclude_classes:
+  - qr_code
+  - linear_barcode
+  - barcode
+  - datamatrix
+  price_compact_classes_prefixes:
+  - main_price
+  crop_expand_px: 3
+super_resolution:
+  enabled: true
+  profile: light
+  strategy: replace_if_small
+  save_crops: true
+  include_raw_when_appending: false
+  max_variants_per_crop: 1
+  keep_failed_records: false
+  apply_to:
+  - main_price*
+  - '*price*'
+  - '*kopeeks*'
+  - '*discount*'
+  - product_name
+  - scale_number
+  - promo_header
+  - footer_note
+  - card_price_small
+  - no_card_price_small
+  skip_for:
+  - full_tag
+  - qr_code
+  - linear_barcode
+  - barcode
+  - datamatrix
+  trigger:
+    run_always: false
+    run_if_min_side_lt: 220
+    run_if_height_lt: 56
+    run_if_width_lt: 0
+    run_if_area_lt: 0
+    run_if_aspect_gt: 0.0
+    run_if_aspect_lt: 0.0
+    always_for_classes:
+    - main_price*
+    - '*kopeeks*'
+    - '*discount*'
+    - '*old_price*'
+  profiles:
+    light:
+      backends:
+      - name: opencv_lanczos_x2
+        backend: opencv_resize
+        method: lanczos
+        scale: 2.0
+        min_side: 0
+        max_side: 1200
+        sharpen: true
+        sharpen_amount: 0.08
+      - name: opencv_fsrcnn_x2_optional
+        backend: opencv_dnn_superres
+        method: dnn_superres
+        model_path: ''
+        model_name: fsrcnn
+        model_scale: 2
+        scale: 2.0
+        min_side: 0
+        max_side: 1200
+        sharpen: false

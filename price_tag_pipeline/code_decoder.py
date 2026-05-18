@@ -25,6 +25,7 @@ import numpy as np
 
 from .image_ops import crop_box, normalize_for_ocr, upscale_if_small
 from .pipeline_types import Box, DecodedCode
+from .tag_qr_enhancement import make_qr_preprocess_variants, warp_qr_from_points
 
 
 class CodeDecoder:
@@ -36,11 +37,31 @@ class CodeDecoder:
         qr_roi_scan: bool = True,
         preprocessing_variants: bool = True,
         keep_undecoded_qr: bool = True,
+        qr_sr_enabled: bool = True,
+        qr_sr_scale: float = 2.0,
+        qr_sr_min_side: int = 420,
+        qr_sr_max_side: int = 1400,
+        qr_sr_method: str = "lanczos",
+        qr_perspective_warp: bool = True,
+        qr_morphology: bool = True,
+        max_rois: int = 6,
+        max_variants_per_roi: int = 10,
+        qr_contour_max_rois: int = 4,
     ) -> None:
         self.try_opencv_qr = bool(try_opencv_qr)
         self.qr_roi_scan = bool(qr_roi_scan)
         self.preprocessing_variants = bool(preprocessing_variants)
         self.keep_undecoded_qr = bool(keep_undecoded_qr)
+        self.qr_sr_enabled = bool(qr_sr_enabled)
+        self.qr_sr_scale = float(qr_sr_scale)
+        self.qr_sr_min_side = int(qr_sr_min_side)
+        self.qr_sr_max_side = int(qr_sr_max_side)
+        self.qr_sr_method = str(qr_sr_method or "lanczos")
+        self.qr_perspective_warp = bool(qr_perspective_warp)
+        self.qr_morphology = bool(qr_morphology)
+        self.max_rois = max(1, int(max_rois))
+        self.max_variants_per_roi = max(1, int(max_variants_per_roi))
+        self.qr_contour_max_rois = max(0, int(qr_contour_max_rois))
         self.pyzbar_decode = None
         if use_pyzbar:
             try:
@@ -88,6 +109,9 @@ class CodeDecoder:
             keys.add(key)
             uniq.append((x1, y1, x2, y2, kind))
 
+        uniq.sort(key=lambda r: self._roi_priority(r, w=w, h=h))
+        if len(uniq) > self.max_rois:
+            uniq = uniq[: self.max_rois]
         self.last_debug["roi_count"] = len(uniq)
         for x1, y1, x2, y2, kind in uniq:
             crop = image[y1:y2, x1:x2]
@@ -141,6 +165,24 @@ class CodeDecoder:
         boxes.extend(self._contour_qr_like_rois(image))
         return [b.clip(w, h) for b in boxes if b.area > 0]
 
+    def _roi_priority(self, roi: Tuple[int, int, int, int, str], *, w: int, h: int) -> Tuple[int, float]:
+        x1, y1, x2, y2, kind = roi
+        cx = (x1 + x2) * 0.5 / max(1, w)
+        cy = (y1 + y2) * 0.5 / max(1, h)
+        area = max(1, (x2 - x1) * (y2 - y1)) / max(1, w * h)
+        order = {
+            "full_tag": 0,
+            "qr_roi_top_right": 1,
+            "qr_roi_upper_right_square": 2,
+            "qr_roi_right_mid": 3,
+            "barcode_roi_bottom": 4,
+            "qr_roi_contour": 5,
+        }
+        # Prefer upper-right square-ish contours, but keep full_tag first.
+        right_top_bonus = abs(1.0 - cx) + cy
+        size_penalty = abs(area - 0.16)
+        return (order.get(kind, 9), float(right_top_bonus + 0.35 * size_penalty))
+
     def _contour_qr_like_rois(self, image: np.ndarray) -> List[Box]:
         h, w = image.shape[:2]
         out: List[Box] = []
@@ -162,14 +204,18 @@ class CodeDecoder:
                     out.append(Box("qr_roi_contour", x - pad, y - pad, x + ww + pad, y + hh + pad, 0.18, "qr_contour_roi"))
         except Exception:
             return []
-        return out[:8]
+        out.sort(key=lambda b: (0 if b.x1 > int(w * 0.45) and b.y1 < int(h * 0.72) else 1, -b.area))
+        return out[: self.qr_contour_max_rois]
 
     def _decode_crop(self, image: np.ndarray, offset: Tuple[int, int], kind_hint: str) -> List[DecodedCode]:
         out: List[DecodedCode] = []
         if image is None or image.size == 0:
             return out
         ox, oy = offset
-        for variant_name, img2, scale in self._preprocess_variants(image):
+        variants = self._preprocess_variants(image)
+        if len(variants) > self.max_variants_per_roi:
+            variants = variants[: self.max_variants_per_roi]
+        for variant_name, img2, scale in variants:
             self.last_debug.setdefault("attempts", []).append({
                 "roi": kind_hint,
                 "variant": variant_name,
@@ -218,6 +264,25 @@ class CodeDecoder:
             variants.append(("adaptive_inv", 255 - adap, scale))
         except Exception:
             pass
+
+        # QR-specific SR + denoise + morphology variants.  These are added after
+        # the generic OCR variants so normal decoding remains cheap when the QR is
+        # already readable, but blurred tracks get a stronger fallback.
+        try:
+            for name, qr_img, qr_scale in make_qr_preprocess_variants(
+                image,
+                sr_enabled=self.qr_sr_enabled,
+                sr_scale=self.qr_sr_scale,
+                sr_min_side=self.qr_sr_min_side,
+                sr_max_side=self.qr_sr_max_side,
+                sr_method=self.qr_sr_method,
+                morphology=self.qr_morphology,
+            ):
+                if name == "qr_raw":
+                    continue
+                variants.append((name, qr_img, float(qr_scale)))
+        except Exception:
+            pass
         return variants
 
     def _decode_opencv_qr(self, image: np.ndarray, scale: float, offset: Tuple[int, int], decoder_suffix: str = "") -> List[DecodedCode]:
@@ -229,19 +294,60 @@ class CodeDecoder:
             if retval and points is not None:
                 for payload, pts in zip(decoded_info, points):
                     out.append(self._decoded_qr_from_points(payload, pts, scale, (ox, oy), decoder=f"opencv_qr_multi:{decoder_suffix}"))
+                    if not payload and self.qr_perspective_warp:
+                        out.extend(self._decode_warped_qr(image, pts, scale=scale, offset=(ox, oy), decoder_suffix=decoder_suffix))
             else:
                 payload, pts, _ = self.qr_detector.detectAndDecode(image)
                 if pts is not None:
                     out.append(self._decoded_qr_from_points(payload, pts, scale, (ox, oy), decoder=decoder_name))
+                    if not payload and self.qr_perspective_warp:
+                        out.extend(self._decode_warped_qr(image, pts, scale=scale, offset=(ox, oy), decoder_suffix=decoder_suffix))
                 # Curved decoder is slower but sometimes helps on perspective/noisy crops.
                 if not payload and hasattr(self.qr_detector, "detectAndDecodeCurved"):
                     payload2, pts2, _ = self.qr_detector.detectAndDecodeCurved(image)
                     if pts2 is not None:
                         out.append(self._decoded_qr_from_points(payload2, pts2, scale, (ox, oy), decoder=f"opencv_qr_curved:{decoder_suffix}"))
+                        if not payload2 and self.qr_perspective_warp:
+                            out.extend(self._decode_warped_qr(image, pts2, scale=scale, offset=(ox, oy), decoder_suffix=f"curved:{decoder_suffix}"))
         except Exception:
             pass
         if not self.keep_undecoded_qr:
             out = [r for r in out if r.decoded]
+        return out
+
+    def _decode_warped_qr(self, image: np.ndarray, pts: Any, *, scale: float, offset: Tuple[int, int], decoder_suffix: str = "") -> List[DecodedCode]:
+        """Try perspective-normalized QR when OpenCV found points but no payload."""
+        out: List[DecodedCode] = []
+        ox, oy = offset
+        try:
+            warped, rect = warp_qr_from_points(image, pts, border=18, min_size=192, max_size=768)
+            warp_variants: List[Tuple[str, np.ndarray]] = [("warp_raw", warped)]
+            for name, v, _ in make_qr_preprocess_variants(
+                warped,
+                sr_enabled=False,
+                morphology=self.qr_morphology,
+            ):
+                if name != "qr_raw":
+                    warp_variants.append(("warp_" + name, v))
+            seen_names = set()
+            for name, wimg in warp_variants:
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                payload, warped_pts, _ = self.qr_detector.detectAndDecode(wimg)
+                if payload:
+                    out.append(self._decoded_qr_from_points(payload, pts, scale, (ox, oy), decoder=f"opencv_qr_perspective:{decoder_suffix}:{name}"))
+                    break
+                if self.pyzbar_decode is not None:
+                    pyz = self._decode_pyzbar(wimg, scale=1.0, offset=(0, 0), decoder_suffix=f"perspective:{decoder_suffix}:{name}")
+                    for r in pyz:
+                        if r.decoded:
+                            # pyzbar bbox is in warped coordinates.  For the track
+                            # result, keep the original QR detector bbox.
+                            out.append(self._decoded_qr_from_points(r.payload, pts, scale, (ox, oy), decoder=f"pyzbar_perspective:{decoder_suffix}:{name}"))
+                            return out
+        except Exception:
+            return []
         return out
 
     def _decoded_qr_from_points(self, payload: Any, pts: Any, scale: float, offset: Tuple[int, int], *, decoder: str) -> DecodedCode:
