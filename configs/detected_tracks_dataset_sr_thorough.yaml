@@ -322,7 +322,7 @@ code_decoder:
   qr_sr_method: lanczos
   qr_perspective_warp: true
   qr_morphology: true
-  max_rois: 6
+  max_rois: 8
   max_variants_per_roi: 10
   qr_contour_max_rois: 4
 ocr:

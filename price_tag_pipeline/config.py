@@ -40,7 +40,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
   "code_decoder": {"enabled": True, "use_pyzbar": True, "try_opencv_qr": True, "qr_roi_scan": True, "preprocessing_variants": True, "keep_undecoded_qr": True,
         "qr_sr_enabled": True, "qr_sr_scale": 2.0, "qr_sr_min_side": 420, "qr_sr_max_side": 1400, "qr_sr_method": "lanczos",
-        "qr_perspective_warp": True, "qr_morphology": True, "max_rois": 6, "max_variants_per_roi": 10, "qr_contour_max_rois": 4,},
+        "qr_perspective_warp": True, "qr_morphology": True, "max_rois": 8, "max_variants_per_roi": 10, "qr_contour_max_rois": 4,},
 
   "ocr": {"backend": "paddle", "gpu": False, "full_tag_ocr": True, "debug": False,
           "paddle": {"lang": "ru", "ocr_version": "PP-OCRv5", "engine": "","use_angle_cls": True, "text_detection_model_name": "PP-OCRv5_mobile_det",

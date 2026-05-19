@@ -111,7 +111,17 @@ class CodeDecoder:
 
         uniq.sort(key=lambda r: self._roi_priority(r, w=w, h=h))
         if len(uniq) > self.max_rois:
-            uniq = uniq[: self.max_rois]
+            # Regression guard: layout-provided code boxes are direct evidence.
+            # The previous sorter could push exact qr_code/barcode hint boxes
+            # behind generic full/right ROIs and then cut them by max_rois.
+            # Keep all code hints first and spend the remaining budget on
+            # heuristic fallbacks.
+            protected = [r for r in uniq if self._is_code_hint_kind(r[4])]
+            fallbacks = [r for r in uniq if not self._is_code_hint_kind(r[4])]
+            if len(protected) >= self.max_rois:
+                uniq = protected[: self.max_rois]
+            else:
+                uniq = protected + fallbacks[: max(0, self.max_rois - len(protected))]
         self.last_debug["roi_count"] = len(uniq)
         for x1, y1, x2, y2, kind in uniq:
             crop = image[y1:y2, x1:x2]
@@ -159,6 +169,11 @@ class CodeDecoder:
             Box("qr_roi_top_right", int(w * 0.52), 0, w, int(h * 0.72), 0.25, "qr_roi_scan"),
             Box("qr_roi_upper_right_square", int(w * 0.58), 0, w, min(h, int(w * 0.48)), 0.25, "qr_roi_scan"),
             Box("qr_roi_right_mid", int(w * 0.52), int(h * 0.15), w, int(h * 0.82), 0.20, "qr_roi_scan"),
+            # Full-frame/video crops may contain a poster/banner QR below the
+            # canonical shelf-label header.  Keep a wider mid/lower-right ROI so
+            # such codes are still attempted when the exact layout hint is absent.
+            Box("qr_roi_right_wide", int(w * 0.38), int(h * 0.18), w, int(h * 0.90), 0.18, "qr_roi_scan"),
+            Box("qr_roi_mid_lower_right", int(w * 0.32), int(h * 0.42), w, h, 0.18, "qr_roi_scan"),
             Box("barcode_roi_bottom", int(w * 0.20), int(h * 0.55), w, h, 0.18, "qr_roi_scan"),
         ])
         # Also try detected QR-like square components from binarized image.
@@ -170,18 +185,39 @@ class CodeDecoder:
         cx = (x1 + x2) * 0.5 / max(1, w)
         cy = (y1 + y2) * 0.5 / max(1, h)
         area = max(1, (x2 - x1) * (y2 - y1)) / max(1, w * h)
+        kind_l = str(kind or "").lower()
+        if self._is_code_hint_kind(kind_l):
+            return (-10, 0.0)
         order = {
             "full_tag": 0,
             "qr_roi_top_right": 1,
             "qr_roi_upper_right_square": 2,
             "qr_roi_right_mid": 3,
-            "barcode_roi_bottom": 4,
-            "qr_roi_contour": 5,
+            "qr_roi_right_wide": 4,
+            "qr_roi_mid_lower_right": 5,
+            "barcode_roi_bottom": 6,
+            "qr_roi_contour": 7,
         }
-        # Prefer upper-right square-ish contours, but keep full_tag first.
+        # Prefer upper-right square-ish contours, but keep full_tag and explicit
+        # code hints first.
         right_top_bonus = abs(1.0 - cx) + cy
         size_penalty = abs(area - 0.16)
-        return (order.get(kind, 9), float(right_top_bonus + 0.35 * size_penalty))
+        return (order.get(kind_l, 9), float(right_top_bonus + 0.35 * size_penalty))
+
+    @staticmethod
+    def _is_code_hint_kind(kind: str) -> bool:
+        kind_l = str(kind or "").lower().strip()
+        return kind_l in {
+            "qr_code",
+            "linear_barcode",
+            "barcode",
+            "datamatrix",
+            "data_matrix",
+            "ean",
+            "ean13",
+            "ean_13",
+            "upc",
+        }
 
     def _contour_qr_like_rois(self, image: np.ndarray) -> List[Box]:
         h, w = image.shape[:2]
@@ -291,24 +327,35 @@ class CodeDecoder:
         decoder_name = "opencv_qr" + (f":{decoder_suffix}" if decoder_suffix else "")
         try:
             retval, decoded_info, points, _ = self.qr_detector.detectAndDecodeMulti(image)
+            multi_decoded = False
             if retval and points is not None:
                 for payload, pts in zip(decoded_info, points):
-                    out.append(self._decoded_qr_from_points(payload, pts, scale, (ox, oy), decoder=f"opencv_qr_multi:{decoder_suffix}"))
-                    if not payload and self.qr_perspective_warp:
+                    payload_s = str(payload or "")
+                    multi_decoded = multi_decoded or bool(payload_s)
+                    out.append(self._decoded_qr_from_points(payload_s, pts, scale, (ox, oy), decoder=f"opencv_qr_multi:{decoder_suffix}"))
+                    if not payload_s and self.qr_perspective_warp:
                         out.extend(self._decode_warped_qr(image, pts, scale=scale, offset=(ox, oy), decoder_suffix=decoder_suffix))
-            else:
+                multi_decoded = multi_decoded or any(r.decoded for r in out)
+
+            # Important fallback: OpenCV's multi decoder can return only points or
+            # fail to decode while the single-code decoder succeeds on the same
+            # crop.  Previously the single decoder was skipped whenever multi
+            # returned points, which caused regressions on blurred video frames.
+            payload = ""
+            if not multi_decoded:
                 payload, pts, _ = self.qr_detector.detectAndDecode(image)
                 if pts is not None:
                     out.append(self._decoded_qr_from_points(payload, pts, scale, (ox, oy), decoder=decoder_name))
                     if not payload and self.qr_perspective_warp:
                         out.extend(self._decode_warped_qr(image, pts, scale=scale, offset=(ox, oy), decoder_suffix=decoder_suffix))
-                # Curved decoder is slower but sometimes helps on perspective/noisy crops.
-                if not payload and hasattr(self.qr_detector, "detectAndDecodeCurved"):
-                    payload2, pts2, _ = self.qr_detector.detectAndDecodeCurved(image)
-                    if pts2 is not None:
-                        out.append(self._decoded_qr_from_points(payload2, pts2, scale, (ox, oy), decoder=f"opencv_qr_curved:{decoder_suffix}"))
-                        if not payload2 and self.qr_perspective_warp:
-                            out.extend(self._decode_warped_qr(image, pts2, scale=scale, offset=(ox, oy), decoder_suffix=f"curved:{decoder_suffix}"))
+
+            # Curved decoder is slower but sometimes helps on perspective/noisy crops.
+            if not any(r.decoded for r in out) and hasattr(self.qr_detector, "detectAndDecodeCurved"):
+                payload2, pts2, _ = self.qr_detector.detectAndDecodeCurved(image)
+                if pts2 is not None:
+                    out.append(self._decoded_qr_from_points(payload2, pts2, scale, (ox, oy), decoder=f"opencv_qr_curved:{decoder_suffix}"))
+                    if not payload2 and self.qr_perspective_warp:
+                        out.extend(self._decode_warped_qr(image, pts2, scale=scale, offset=(ox, oy), decoder_suffix=f"curved:{decoder_suffix}"))
         except Exception:
             pass
         if not self.keep_undecoded_qr:
